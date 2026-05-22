@@ -23,6 +23,12 @@ parser.add_argument("--motion_file", type=str, default=None, help="Path to a sin
 parser.add_argument("--motion_path", type=str, default=None, help="The path to the directory containing motion files for random sampling (no export).")
 
 parser.add_argument("--export_motion_name", type=str, default=None, help="Select one motion for exporter (required when --motion_file is used).")
+parser.add_argument(
+    "--export_motion_bundle",
+    action="store_true",
+    default=False,
+    help="Export one ONNX model containing all motions from --motion_path. Uses motion_idx + time_step at runtime.",
+)
 
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -64,7 +70,11 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 
 # Import extensions to set up environment tasks
 import soccer.tasks  # noqa: F401
-from soccer.utils.exporter import attach_onnx_metadata, export_motion_policy_as_onnx
+from soccer.utils.exporter import (
+    attach_onnx_metadata,
+    export_motion_policy_as_onnx,
+    export_multi_motion_policy_as_onnx,
+)
 
 def get_motion_files(motion_path: str) -> list[str]:
     """
@@ -216,7 +226,27 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     raise ValueError(f"Requested export motion '{name}' not found in {args_cli.motion_path}.")
                 export_targets.append((match, name))
 
-    if export_targets:
+    if args_cli.export_motion_bundle:
+        if args_cli.motion_path is None:
+            raise ValueError("--export_motion_bundle requires --motion_path.")
+        export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
+        ckpt = args_cli.checkpoint.split('_')[1].split('.')[0]
+        filename = f"policy_{ckpt}_bundle.onnx"
+        export_multi_motion_policy_as_onnx(
+            env.unwrapped,
+            ppo_runner.alg.policy,
+            normalizer=ppo_runner.obs_normalizer,
+            path=export_model_dir,
+            filename=filename,
+        )
+        attach_onnx_metadata(
+            env.unwrapped,
+            args_cli.wandb_path if args_cli.wandb_path else "none",
+            export_model_dir,
+            filename=filename,
+        )
+        print(f"[INFO]: Exported bundled multi-motion policy to: {os.path.join(export_model_dir, filename)}")
+    elif export_targets:
         export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
         ckpt = args_cli.checkpoint.split('_')[1].split('.')[0]
 

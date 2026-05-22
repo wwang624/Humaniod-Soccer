@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
-from isaaclab.utils.math import quat_error_magnitude, quat_apply, quat_inv, quat_apply_inverse
+from isaaclab.utils.math import quat_error_magnitude, quat_apply, quat_inv, quat_rotate_inverse
 
 from soccer.tasks.tracking.mdp.commands_multi_motion_soccer import MotionCommand
 from soccer.tasks.tracking.mdp.observations import get_target_point_world
@@ -516,6 +516,6 @@ def pelvis_orientation(env: ManagerBasedRLEnv, command_name: str = "motion") -> 
     gravity_vec_w = robot.data.GRAVITY_VEC_W
     
     # Project gravity vector to pelvis local frame.
-    pelvis_proj_gravity = quat_apply_inverse(command.robot_pelvis_quat_w, gravity_vec_w)
+    pelvis_proj_gravity = quat_rotate_inverse(command.robot_pelvis_quat_w, gravity_vec_w)
     # print("pelvis_proj_gravity:", gravity_vec_w, pelvis_proj_gravity)
     return torch.sum(torch.square(pelvis_proj_gravity[:, :2]), dim=1)
