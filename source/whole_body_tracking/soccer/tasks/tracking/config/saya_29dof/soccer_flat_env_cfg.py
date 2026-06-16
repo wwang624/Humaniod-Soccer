@@ -162,3 +162,14 @@ class Saya29DoFFlatSoccerStudentEnvCfg(Saya29DoFFlatKickEnvCfg):
         )
         self.observations.teacher = teacher_obs
         self.observations.policy = student_obs
+
+
+@configclass
+class Saya29DoFFlatSoccerDistillEnvCfg(Saya29DoFFlatSoccerStudentEnvCfg):
+    """Dedicated Saya soccer distillation environment with looser rollout terminations."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.terminations.anchor_pos_z.params["threshold"] = 0.15
+        self.terminations.anchor_ori = None
+        self.terminations.ee_body_pos = None

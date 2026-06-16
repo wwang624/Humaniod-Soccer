@@ -478,3 +478,14 @@ class G1FlatSoccerStudentEnvCfg(G1FlatKickEnvCfg):
         )
         self.observations.teacher = teacher_obs
         self.observations.policy = student_obs
+
+
+@configclass
+class G1FlatSoccerDistillEnvCfg(G1FlatSoccerStudentEnvCfg):
+    """Dedicated soccer distillation environment with looser rollout terminations."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.terminations.anchor_pos_z.params["threshold"] = 0.15
+        self.terminations.anchor_ori = None
+        self.terminations.ee_body_pos = None

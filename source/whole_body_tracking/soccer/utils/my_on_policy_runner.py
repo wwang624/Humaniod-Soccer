@@ -119,19 +119,34 @@ class MotionStudentTeacherRecurrent(StudentTeacherRecurrent):
 
 
 class MotionDistillation(Distillation):
-    """Distillation that rolls out the student mean action instead of noisy samples."""
+    """Distillation with configurable student rollout actions."""
 
-    def __init__(self, *args, freeze_student_obs_normalizer: bool | None = None, **kwargs):
+    def __init__(
+        self,
+        *args,
+        freeze_student_obs_normalizer: bool | None = None,
+        rollout_mode: str | None = None,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         if freeze_student_obs_normalizer is None:
             value = os.environ.get("SOCCER_FREEZE_STUDENT_OBS_NORMALIZER", "0").strip().lower()
             freeze_student_obs_normalizer = value in {"1", "true", "yes", "on"}
+        if rollout_mode is None:
+            rollout_mode = os.environ.get("SOCCER_DISTILL_ROLLOUT_MODE", "mean").strip().lower()
+        if rollout_mode not in {"mean", "sample"}:
+            raise ValueError(f"Unsupported SOCCER_DISTILL_ROLLOUT_MODE={rollout_mode!r}; expected 'mean' or 'sample'.")
         self.freeze_student_obs_normalizer = freeze_student_obs_normalizer
+        self.rollout_mode = rollout_mode
         if self.freeze_student_obs_normalizer:
             print("[INFO] MotionDistillation: freezing student observation normalizer updates.")
+        print(f"[INFO] MotionDistillation: rollout_mode={self.rollout_mode}.")
 
     def act(self, obs):
-        self.transition.actions = self.policy.act_inference(obs).detach()
+        if self.rollout_mode == "sample":
+            self.transition.actions = self.policy.act(obs).detach()
+        else:
+            self.transition.actions = self.policy.act_inference(obs).detach()
         self.transition.privileged_actions = self.policy.evaluate(obs).detach()
         self.transition.observations = obs
         return self.transition.actions

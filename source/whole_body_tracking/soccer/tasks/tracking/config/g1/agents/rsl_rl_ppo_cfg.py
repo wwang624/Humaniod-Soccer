@@ -68,7 +68,7 @@ class G1FlatStudentTeacherPPORunnerCfg(RslRlDistillationRunnerCfg):
     obs_groups = {"policy": ["policy"], "teacher": ["teacher"]}
     policy = RslRlDistillationStudentTeacherRecurrentCfg(
         class_name="MotionStudentTeacherRecurrent",
-        init_noise_std=1.0e-4,
+        init_noise_std=0.1,
         student_obs_normalization=True,
         teacher_obs_normalization=False,
         student_hidden_dims=[128, 64, 32],

@@ -98,7 +98,7 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": soccer_flat_env_cfg.Saya29DoFFlatSoccerStudentEnvCfg,
+        "env_cfg_entry_point": soccer_flat_env_cfg.Saya29DoFFlatSoccerDistillEnvCfg,
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Saya29DoFStudentTeacherPPORunnerCfg",
     },
 )
