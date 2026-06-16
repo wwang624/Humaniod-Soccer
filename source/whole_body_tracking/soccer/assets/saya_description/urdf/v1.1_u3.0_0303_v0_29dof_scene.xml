@@ -1,0 +1,38 @@
+<mujoco model="v1.1_u3.0_0303_v0_29dof scene">
+  <include file="v1.1_u3.0_0303_v0_29dof_floating.xml"/>
+
+  <statistic center="0.0 0.0 0.9" extent="1.5"/>
+
+  <visual>
+    <headlight diffuse="0.7 0.7 0.7" ambient="0.2 0.2 0.2" specular="0.2 0.2 0.2"/>
+    <rgba haze="0.15 0.2 0.25 1"/>
+    <global azimuth="-150" elevation="-20"/>
+  </visual>
+
+  <asset>
+    <texture
+      name="grid"
+      type="2d"
+      builtin="checker"
+      rgb1="0.18 0.22 0.25"
+      rgb2="0.10 0.12 0.14"
+      width="512"
+      height="512"
+      mark="edge"
+      markrgb="0.8 0.8 0.8"
+    />
+    <material
+      name="grid"
+      texture="grid"
+      texuniform="true"
+      texrepeat="8 8"
+      reflectance="0.15"
+    />
+  </asset>
+
+  <worldbody>
+    <light pos="1.5 0 3.5" dir="0 0 -1" directional="true"/>
+    <light pos="-1.0 1.0 2.5" dir="0 0 -1" directional="true"/>
+    <geom name="floor" type="plane" size="0 0 0.05" material="grid"/>
+  </worldbody>
+</mujoco>

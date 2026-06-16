@@ -5,7 +5,14 @@ import torch
 from typing import TYPE_CHECKING
 
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.utils.math import matrix_from_quat, subtract_frame_transforms, quat_apply, quat_inv
+from isaaclab.utils.math import (
+    matrix_from_quat,
+    quat_apply,
+    quat_inv,
+    quat_mul,
+    subtract_frame_transforms,
+    yaw_quat,
+)
 
 from soccer.tasks.tracking.mdp.commands_multi_motion_soccer import MotionCommand
 
@@ -111,9 +118,8 @@ def get_target_point_world(env: ManagerBasedEnv, command_name: str = "motion") -
 def get_target_point_base(env: ManagerBasedEnv, command_name: str = "motion") -> torch.Tensor:
     command = _get_motion_command(env, command_name)
     target_world = get_target_point_world(env, command_name)
-    # delta = target_world - command.robot_anchor_pos_w
-    delta = target_world - command.robot_pelvis_pos_w
-    return quat_apply(quat_inv(command.robot_pelvis_quat_w), delta)
+    delta = target_world - command.robot_soccer_obs_pos_w
+    return quat_apply(quat_inv(command.robot_soccer_obs_quat_w), delta)
 
 
 def _positional_encoding(vec: torch.Tensor, num_freqs: int = 6) -> torch.Tensor:
@@ -151,7 +157,7 @@ def target_point_pos_first_frame(env: ManagerBasedEnv, command_name: str = "moti
 
     step_buf = getattr(env, "episode_length_buf", None)
     if step_buf is None:
-        raise AttributeError("ManagerBasedEnv missing episode_length_buf required for target point caching")
+        return cache
 
     first_step_mask = (step_buf == 0)
     if torch.any(first_step_mask):
@@ -185,7 +191,7 @@ def blind_zone_target_point_pos(env: ManagerBasedEnv, command_name: str = "motio
     
     # Compute robot-target (x, y) distance in world coordinates.
     target_world = get_target_point_world(env, command_name)
-    robot_pos = command.robot_pelvis_pos_w
+    robot_pos = command.robot_soccer_obs_pos_w
     # Horizontal distance only.
     distance_xy = torch.norm(target_world[:, :2] - robot_pos[:, :2], dim=-1)
     
@@ -221,9 +227,9 @@ def target_destination_pos_local(env: ManagerBasedEnv, command_name: str = "moti
     else:
         target_world = command.target_destination_pos
 
-    delta = target_world - command.robot_pelvis_pos_w
-    # print("position:", quat_apply(quat_inv(command.robot_pelvis_quat_w), delta))
-    return quat_apply(quat_inv(command.robot_pelvis_quat_w), delta)
+    delta = target_world - command.robot_soccer_obs_pos_w
+    # print("position:", quat_apply(quat_inv(command.robot_soccer_obs_quat_w), delta))
+    return quat_apply(quat_inv(command.robot_soccer_obs_quat_w), delta)
 
 
 def target_destination_pos_local_first_frame(env: ManagerBasedEnv, command_name: str = "motion") -> torch.Tensor:
@@ -237,7 +243,7 @@ def target_destination_pos_local_first_frame(env: ManagerBasedEnv, command_name:
 
     step_buf = getattr(env, "episode_length_buf", None)
     if step_buf is None:
-        raise AttributeError("ManagerBasedEnv missing episode_length_buf required for target destination caching")
+        return cache
 
     first_step_mask = (step_buf == 0)
     if torch.any(first_step_mask):
@@ -249,6 +255,56 @@ def target_destination_pos_local_first_frame(env: ManagerBasedEnv, command_name:
     return getattr(env, cache_name)
     # Positional encoding path is intentionally disabled here.
     return _positional_encoding(getattr(env, cache_name), num_freqs=6)
+
+
+def target_destination_pos_local_ball_anchor_first_frame(
+    env: ManagerBasedEnv,
+    command_name: str = "motion",
+) -> torch.Tensor:
+    """Deployment-aligned student goal cue.
+
+    The teacher observes the training target destination sampled by the environment. The student observes the same
+    target intention as a first-frame ball-to-goal anchor, matching the deployment path where only an initial local
+    ball cue and an intended ball-to-goal vector are available.
+    """
+    command = _get_motion_command(env, command_name)
+    ball_local = target_point_pos_first_frame(env, command_name)
+
+    current_yaw = yaw_quat(command.robot_soccer_obs_quat_w)
+    cache_name = f"_{command_name}_start_pelvis_yaw_quat_cache"
+    start_yaw = getattr(env, cache_name, None)
+    if start_yaw is None or start_yaw.shape[0] != env.num_envs:
+        start_yaw = current_yaw.clone()
+        setattr(env, cache_name, start_yaw)
+
+    step_buf = getattr(env, "episode_length_buf", None)
+    if step_buf is None:
+        goal_local = target_destination_pos_local(env, command_name)
+        anchor_cache_name = f"_{command_name}_ball_to_goal_anchor_cache"
+        if getattr(env, anchor_cache_name, None) is None:
+            setattr(env, anchor_cache_name, goal_local - ball_local)
+        return goal_local
+    first_step_mask = step_buf == 0
+
+    anchor_cache_name = f"_{command_name}_ball_to_goal_anchor_cache"
+    anchor_cache = getattr(env, anchor_cache_name, None)
+    if anchor_cache is None or anchor_cache.shape[0] != env.num_envs:
+        goal_local = target_destination_pos_local(env, command_name)
+        anchor_cache = goal_local - ball_local
+        setattr(env, anchor_cache_name, anchor_cache)
+
+    if torch.any(first_step_mask):
+        start_yaw = getattr(env, cache_name)
+        start_yaw[first_step_mask] = current_yaw[first_step_mask]
+        setattr(env, cache_name, start_yaw)
+        goal_local = target_destination_pos_local(env, command_name)
+        anchor_cache = getattr(env, anchor_cache_name)
+        anchor_cache[first_step_mask] = goal_local[first_step_mask] - ball_local[first_step_mask]
+        setattr(env, anchor_cache_name, anchor_cache)
+
+    relative_heading = quat_mul(quat_inv(current_yaw), getattr(env, cache_name))
+    anchor_local = quat_apply(relative_heading, getattr(env, anchor_cache_name))
+    return ball_local + anchor_local
     
 
 

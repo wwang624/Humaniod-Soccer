@@ -408,7 +408,9 @@ def attach_onnx_metadata(env: ManagerBasedRLEnv, run_path: str, path: str, filen
         "observation_names": env.observation_manager.active_terms["policy"],
         "action_scale": env.action_manager.get_term("joint_pos")._scale[0].cpu().tolist(),
         "anchor_body_name": cmd.cfg.anchor_body_name,
+        "soccer_obs_body_name": getattr(cmd, "soccer_obs_body_name", ""),
         "body_names": cmd.cfg.body_names,
+        "root_body_name": next((name for name in ("pelvis", "base_link") if name in cmd.cfg.body_names), cmd.cfg.anchor_body_name),
     }
     if hasattr(cmd.motion, "motion_name"):
         metadata["motion_names"] = list(cmd.motion.motion_name)

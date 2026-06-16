@@ -447,13 +447,5 @@ class G1FlatSoccerStudentEnvCfg(G1FlatKickEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         student_obs = self.observations.policy.copy()
-        student_obs.target_point_pos = ObsTerm(
-            func=mdp.target_point_pos_first_frame,
-            params={"command_name": "motion"},
-        )
-        self.observations.StudentPolicyCfg = student_obs
-
-        student_obs.target_destination_pos_local = ObsTerm(
-            func=mdp.target_destination_pos_local_first_frame,
-            params={"command_name": "motion"},
-        )
+        self.observations.teacher = self.observations.policy
+        self.observations.policy = student_obs

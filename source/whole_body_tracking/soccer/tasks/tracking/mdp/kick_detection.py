@@ -85,6 +85,12 @@ class KickContactTracker:
         force_norm = torch.linalg.norm(forces, dim=-1)
         peak_force = force_norm.amax(dim=-1) if force_norm.ndim > 1 else force_norm
         kick_detected = peak_force > horizontal_force_threshold
+        valid_phase_range = getattr(command.cfg, "valid_contact_phase_range", None)
+        if valid_phase_range is not None:
+            lo, hi = valid_phase_range
+            motion_length = command.motion_length.to(device=self._device, dtype=torch.float32).clamp(min=2.0)
+            phase = command.time_steps.to(device=self._device, dtype=torch.float32) / (motion_length - 1.0)
+            kick_detected = kick_detected & (phase >= float(lo)) & (phase <= float(hi))
 
         contact_awarded = self._get_or_init_bool_tensor("target_contact_awarded", default=False)
         new_contact = (~contact_awarded) & kick_detected

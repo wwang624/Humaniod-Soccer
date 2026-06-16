@@ -1,10 +1,10 @@
 from isaaclab.utils import configclass
 from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, RslRlPpoAlgorithmCfg
 from isaaclab_rl.rsl_rl import (
-    RslRlDistillationStudentTeacherCfg,
+    RslRlDistillationRunnerCfg,
     RslRlDistillationStudentTeacherRecurrentCfg,
     RslRlPpoActorCriticRecurrentCfg,
-    RslRlDistillationAlgorithmCfg
+    RslRlDistillationAlgorithmCfg,
 )
 
 @configclass
@@ -58,24 +58,33 @@ LOW_FREQ_SCALE = 0.5
 
 
 @configclass
-class G1FlatStudentTeacherPPORunnerCfg(G1FlatPPORunnerCfg):
-    """RNN-enabled Student-Teacher configuration mirroring the feed-forward defaults."""
+class G1FlatStudentTeacherPPORunnerCfg(RslRlDistillationRunnerCfg):
+    """Distill a recurrent soccer teacher into a deployment-oriented recurrent student."""
 
-    def __post_init__(self):
-        super().__post_init__()
-        self.experiment_name = "g1_flat"
-        self.policy = RslRlDistillationStudentTeacherCfg(
-            init_noise_std=1.0,
-            student_hidden_dims=[512, 256, 128],
-            teacher_hidden_dims=[512, 256, 128],
-            activation="elu",
-        )
-        self.algorithm = RslRlDistillationAlgorithmCfg(
-            num_learning_epochs=5,
-            learning_rate=1.0e-3,
-            gradient_length=24,
-            max_grad_norm=1.0,
-        )
+    num_steps_per_env = 24
+    max_iterations = 100000
+    save_interval = 1000
+    experiment_name = "g1_flat"
+    obs_groups = {"policy": ["policy"], "teacher": ["teacher"]}
+    policy = RslRlDistillationStudentTeacherRecurrentCfg(
+        class_name="MotionStudentTeacherRecurrent",
+        init_noise_std=1.0e-4,
+        student_obs_normalization=True,
+        teacher_obs_normalization=False,
+        student_hidden_dims=[128, 64, 32],
+        teacher_hidden_dims=[128, 64, 32],
+        activation="elu",
+        rnn_type="lstm",
+        rnn_hidden_dim=128,
+        rnn_num_layers=2,
+        teacher_recurrent=True,
+    )
+    algorithm = RslRlDistillationAlgorithmCfg(
+        class_name="MotionDistillation",
+        num_learning_epochs=5,
+        learning_rate=1.0e-3,
+        gradient_length=24,
+    )
 
 
 

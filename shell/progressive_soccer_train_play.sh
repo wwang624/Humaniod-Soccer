@@ -14,7 +14,7 @@ python scripts/rsl_rl/train_multi.py --task Tracking-Terrain-G1-RNN-v0 \
     --motion_path motions/soccer-standard \
     --run_name "${RUN_NAME}" \
     --num_envs 8192 \
-    --max_iterations 4000 \
+    --max_iterations 10000 \
     --headless
 
 LOAD_RUN="$(find "${EXPERIMENT_DIR}" -maxdepth 1 -mindepth 1 -type d -name "*_${RUN_NAME}" | sort | tail -n 1 | xargs -r basename)"

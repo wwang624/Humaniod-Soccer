@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kick-speed-threshold", type=float, default=0.8, help="Planar ball-speed threshold for reset.")
     parser.add_argument("--kick-reset-delay-steps", type=int, default=250, help="Policy steps to wait after kick before reset.")
     parser.add_argument("--kick-armed-min-steps", type=int, default=20, help="Do not arm kick-reset logic before this many policy steps.")
-    parser.add_argument("--fall-height-threshold", type=float, default=0.45, help="Reset if pelvis height drops below this.")
+    parser.add_argument("--fall-height-threshold", type=float, default=0.45, help="Reset if root body height drops below this.")
     parser.add_argument("--max-episode-steps", type=int, default=500, help="Optional hard episode-step limit. Matches the training env by default.")
     parser.add_argument("--ball-height", type=float, default=0.11, help="Ball spawn height.")
     parser.add_argument("--ball-arc-angle", type=float, default=math.pi / 9.0, help="Ball spawn arc half-angle.")
@@ -56,13 +56,46 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--goal-center-x", type=float, default=0.0, help="Goal center x in world coordinates.")
     parser.add_argument("--goal-center-y", type=float, default=-5.0, help="Goal center y in world coordinates.")
     parser.add_argument("--goal-center-z", type=float, default=0.11, help="Goal center z in world coordinates.")
+    parser.add_argument(
+        "--scene-yaw-deg",
+        type=float,
+        default=0.0,
+        help="Rotate robot initial root pose, ball, and goal together around the initial root body by this yaw angle.",
+    )
     parser.add_argument("--goal-length", type=float, default=1.0, help="Goal sampling rectangle length.")
     parser.add_argument("--goal-width", type=float, default=0.5, help="Goal sampling rectangle width.")
-    parser.add_argument("--viewer-distance", type=float, default=3.0, help="Viewer camera distance.")
+    parser.add_argument("--viewer-distance", type=float, default=2.0, help="Viewer camera distance.")
     parser.add_argument("--viewer-elevation", type=float, default=-20.0, help="Viewer camera elevation.")
+    parser.add_argument("--viewer-azimuth", type=float, default=135.0, help="Viewer camera azimuth.")
     parser.add_argument("--ball-radius", type=float, default=0.11, help="Radius of the injected MuJoCo ball.")
     parser.add_argument("--goal-marker-radius", type=float, default=0.11, help="Radius of the red goal marker sphere.")
     parser.add_argument("--manual-ball-step", type=float, default=0.05, help="Manual ball translation step size in meters.")
+    parser.add_argument(
+        "--goal-local-mode",
+        choices=("world", "ball_anchor"),
+        default="world",
+        help=(
+            "world: use the true MuJoCo goal world position. "
+            "ball_anchor: treat the goal as ball_world plus a vector locked in the start heading frame."
+        ),
+    )
+    parser.add_argument(
+        "--ball-to-goal-anchor-source",
+        choices=("world_at_start", "manual"),
+        default="world_at_start",
+        help=(
+            "For --goal-local-mode ball_anchor, world_at_start locks the current MuJoCo goal-ball vector at policy start; "
+            "manual uses --ball-to-goal-anchor."
+        ),
+    )
+    parser.add_argument(
+        "--ball-to-goal-anchor",
+        type=float,
+        nargs=3,
+        default=[5.0, 0.0, 0.0],
+        metavar=("X", "Y", "Z"),
+        help="Manual ball-to-goal vector in the locked start-heading frame for --goal-local-mode ball_anchor.",
+    )
     parser.add_argument("--enable-soccer-noise", action="store_true", default=False, help="Inject observation noise into ball/goal local coordinates.")
     parser.add_argument("--ball-noise-base-std", type=float, default=0.01, help="Base Gaussian std for ball local-position noise in meters.")
     parser.add_argument("--ball-noise-dist-coeff", type=float, default=0.02, help="Additional std per meter of ball distance.")
@@ -70,6 +103,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--goal-noise-base-std", type=float, default=0.005, help="Base Gaussian std for goal local-position noise in meters.")
     parser.add_argument("--goal-noise-dist-coeff", type=float, default=0.01, help="Additional std per meter of goal distance.")
     parser.add_argument("--soccer-noise-print-interval", type=int, default=25, help="Print current soccer-noise strength every N policy steps when enabled.")
+    parser.add_argument("--stale-ball-start-step", type=int, default=-1, help="Freeze observed ball position from this policy step. Negative disables stale-ball simulation.")
+    parser.add_argument("--stale-ball-duration-steps", type=int, default=0, help="Number of policy steps to reuse the frozen ball observation.")
+    parser.add_argument("--stale-ball-print-interval", type=int, default=5, help="Print stale-ball observation/action diagnostics every N policy steps.")
+    parser.add_argument("--print-policy-local-targets", action="store_true", default=False, help="Print ball/goal local coordinates that are fed into the ONNX observation.")
+    parser.add_argument("--policy-local-target-print-interval", type=int, default=1, help="Print local target diagnostics every N policy steps when enabled.")
     return parser.parse_args()
 
 
@@ -118,6 +156,16 @@ def quat_mul_wxyz(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
     )
 
 
+def quat_from_yaw_wxyz(yaw: float) -> np.ndarray:
+    half_yaw = 0.5 * float(yaw)
+    return np.array([math.cos(half_yaw), 0.0, 0.0, math.sin(half_yaw)], dtype=np.float32)
+
+
+def yaw_from_quat_wxyz(q: np.ndarray) -> float:
+    forward = quat_rotate_wxyz(q, np.array([1.0, 0.0, 0.0], dtype=np.float32))
+    return math.atan2(float(forward[1]), float(forward[0]))
+
+
 def quat_inv_wxyz(q: np.ndarray) -> np.ndarray:
     norm = np.dot(q, q)
     if norm < 1e-12:
@@ -136,6 +184,10 @@ def quat_rotate_inverse_wxyz(q: np.ndarray, v: np.ndarray) -> np.ndarray:
     return quat_rotate_wxyz(quat_inv_wxyz(q), v)
 
 
+def rotate_point_around_origin(point: np.ndarray, origin: np.ndarray, rotation_quat: np.ndarray) -> np.ndarray:
+    return origin + quat_rotate_wxyz(rotation_quat, point - origin)
+
+
 @dataclass
 class ModelMetadata:
     joint_names: list[str]
@@ -145,6 +197,8 @@ class ModelMetadata:
     action_scale: np.ndarray
     observation_names: list[str]
     anchor_body_name: str
+    soccer_obs_body_name: str
+    root_body_name: str
     body_names: list[str]
     motion_names: list[str]
     motion_lengths: np.ndarray
@@ -169,6 +223,8 @@ class OnnxSoccerPolicy:
             action_scale=csv_to_float_array(self.model_meta.get("action_scale", "")),
             observation_names=decode_metadata_list(self.model_meta.get("observation_names", "")),
             anchor_body_name=self.model_meta.get("anchor_body_name", "torso_link"),
+            soccer_obs_body_name=self.model_meta.get("soccer_obs_body_name", ""),
+            root_body_name=self.model_meta.get("root_body_name", ""),
             body_names=decode_metadata_list(self.model_meta.get("body_names", "")),
             motion_names=decode_metadata_list(self.model_meta.get("motion_names", "")),
             motion_lengths=csv_to_float_array(self.model_meta.get("motion_lengths", "")),
@@ -339,6 +395,7 @@ class MujocoSoccerSim2Sim:
         self.joint_stiffness = self.policy.metadata.joint_stiffness
         self.joint_damping = self.policy.metadata.joint_damping
         self.action_scale = self.policy.metadata.action_scale
+        self.joint_effort_limit = (4.0 * self.action_scale * self.joint_stiffness).astype(np.float32)
         self.observation_names = self.policy.metadata.observation_names
         self.motion_names = self.policy.metadata.motion_names
         self.motion_lengths = self.policy.reference.get("motion_lengths")
@@ -350,7 +407,16 @@ class MujocoSoccerSim2Sim:
         self.joint_qvel_addr = self._build_joint_addr_array(kind="qvel")
         self.isaac_to_actuator_index = self._build_actuator_mapping()
 
-        self.pelvis_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "pelvis")
+        self.root_body_name = self._resolve_root_body_name()
+        self.root_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, self.root_body_name)
+        if self.root_body_id < 0:
+            raise RuntimeError(f"Unable to locate root body '{self.root_body_name}' in MuJoCo XML.")
+        self.soccer_obs_body_name = self._resolve_soccer_obs_body_name()
+        self.soccer_obs_body_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_BODY, self.soccer_obs_body_name
+        )
+        if self.soccer_obs_body_id < 0:
+            raise RuntimeError(f"Unable to locate soccer obs body '{self.soccer_obs_body_name}' in MuJoCo XML.")
         self.ball_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, args.ball_body_name)
         self.ball_joint_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, args.ball_body_name)
         if self.ball_body_id < 0 or self.ball_joint_id < 0:
@@ -365,7 +431,8 @@ class MujocoSoccerSim2Sim:
         self.ball_qpos_addr = int(self.model.jnt_qposadr[self.ball_joint_id])
         self.ball_qvel_addr = int(self.model.jnt_dofadr[self.ball_joint_id])
         self.anchor_body_index = self.body_names.index(self.anchor_body_name)
-        self.pelvis_body_index = self.body_names.index("pelvis")
+        self.root_body_index = self.body_names.index(self.root_body_name)
+        self.soccer_obs_body_index = self.body_names.index(self.soccer_obs_body_name)
 
         default_max_episode_steps = 500
         self.max_episode_steps = args.max_episode_steps if args.max_episode_steps > 0 else default_max_episode_steps
@@ -385,12 +452,27 @@ class MujocoSoccerSim2Sim:
         self.pending_ball_delta = np.zeros(3, dtype=np.float32)
         self.goal_world = np.zeros(3, dtype=np.float32)
         self.ball_spawn_world = np.zeros(3, dtype=np.float32)
+        self.goal_marker_world = np.zeros(3, dtype=np.float32)
+        self.goal_anchor_heading_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        self.ball_to_goal_anchor = np.asarray(self.args.ball_to_goal_anchor, dtype=np.float32)
+        self.active_ball_to_goal_anchor = self.ball_to_goal_anchor.copy()
+        self.scene_yaw = math.radians(float(self.args.scene_yaw_deg))
+        self.scene_yaw_quat = quat_from_yaw_wxyz(self.scene_yaw)
+        self.scene_rotation_origin = np.zeros(3, dtype=np.float32)
         self.initial_ball_planar_xy = np.zeros(2, dtype=np.float32)
         self.last_ball_speed_xy = 0.0
         self.current_ball_noise_sigma = 0.0
         self.current_goal_noise_sigma = 0.0
         self.current_ball_noise_vec = np.zeros(3, dtype=np.float32)
         self.current_goal_noise_vec = np.zeros(3, dtype=np.float32)
+        self.last_visible_ball_local = np.zeros(3, dtype=np.float32)
+        self.stale_ball_local: np.ndarray | None = None
+        self.current_true_ball_local = np.zeros(3, dtype=np.float32)
+        self.current_obs_ball_local = np.zeros(3, dtype=np.float32)
+        self.current_goal_local = np.zeros(3, dtype=np.float32)
+        self.current_root_pos_w = np.zeros(3, dtype=np.float32)
+        self.current_root_quat_w = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        self.current_stale_ball_active = False
 
         self.reset()
 
@@ -399,9 +481,16 @@ class MujocoSoccerSim2Sim:
         xml_text = path.read_text(encoding="utf-8")
         has_ball = f'name="{self.args.ball_body_name}"' in xml_text
         has_goal_marker = 'name="goal_marker"' in xml_text
-        if has_ball and has_goal_marker:
+        has_actuator = "<actuator" in xml_text
+        has_ground = 'type="plane"' in xml_text or "type='plane'" in xml_text or 'name="ground"' in xml_text or 'name="floor"' in xml_text
+        if has_ball and has_goal_marker and has_actuator and has_ground:
             return str(path)
 
+        ground_block = "" if has_ground else """
+    <geom name="ground" type="plane" pos="0 0 0" size="20 20 0.05"
+          contype="1" conaffinity="1" friction="1.0 0.005 0.0001"
+          rgba="0.35 0.35 0.35 1"/>
+"""
         ball_block = "" if has_ball else f"""
     <body name="{self.args.ball_body_name}" pos="1.0 0.0 {self.args.ball_height:.5f}" quat="1 0 0 0">
         <joint limited="false" name="{self.args.ball_body_name}" type="free"/>
@@ -418,7 +507,21 @@ class MujocoSoccerSim2Sim:
 """
         if "</worldbody>" not in xml_text:
             raise RuntimeError(f"MuJoCo XML at {xml_path} is missing </worldbody>; cannot inject ball body.")
-        xml_text = xml_text.replace("</worldbody>", ball_block + goal_block + "\n</worldbody>", 1)
+        xml_text = xml_text.replace("</worldbody>", ground_block + ball_block + goal_block + "\n</worldbody>", 1)
+
+        if not has_actuator:
+            motor_lines = "\n".join(
+                f'    <motor name="{joint_name}_motor" joint="{joint_name}" gear="1" ctrllimited="false"/>'
+                for joint_name in self.policy.metadata.joint_names
+            )
+            actuator_block = f"""
+  <actuator>
+{motor_lines}
+  </actuator>
+"""
+            if "</mujoco>" not in xml_text:
+                raise RuntimeError(f"MuJoCo XML at {xml_path} is missing </mujoco>; cannot inject actuators.")
+            xml_text = xml_text.replace("</mujoco>", actuator_block + "\n</mujoco>", 1)
 
         runtime_path = path.with_name(f"{path.stem}_runtime_ball.xml")
         runtime_path.write_text(xml_text, encoding="utf-8")
@@ -466,6 +569,33 @@ class MujocoSoccerSim2Sim:
             return np.asarray([joint_to_actuator[name] for name in self.isaac_joint_names], dtype=np.int32)
         except KeyError as exc:
             raise RuntimeError(f"MuJoCo actuators do not cover joint '{exc.args[0]}'.") from exc
+
+    def _resolve_root_body_name(self) -> str:
+        candidates = []
+        if self.policy.metadata.root_body_name:
+            candidates.append(self.policy.metadata.root_body_name)
+        candidates.extend(["pelvis", "base_link", self.anchor_body_name])
+        for name in candidates:
+            if name in self.body_names:
+                return name
+        raise RuntimeError(
+            "Unable to resolve root body from ONNX metadata. "
+            f"root_body_name={self.policy.metadata.root_body_name!r}, body_names={self.body_names}"
+        )
+
+    def _resolve_soccer_obs_body_name(self) -> str:
+        candidates = []
+        if self.policy.metadata.soccer_obs_body_name:
+            candidates.append(self.policy.metadata.soccer_obs_body_name)
+        candidates.append(self.root_body_name)
+        candidates.extend(["pelvis", "base_link", self.anchor_body_name])
+        for name in candidates:
+            if name in self.body_names:
+                return name
+        raise RuntimeError(
+            "Unable to resolve soccer observation body from ONNX metadata. "
+            f"soccer_obs_body_name={self.policy.metadata.soccer_obs_body_name!r}, body_names={self.body_names}"
+        )
 
     def _zero_recurrent_state(self) -> tuple[np.ndarray | None, np.ndarray | None]:
         if not self.policy.is_recurrent:
@@ -542,8 +672,14 @@ class MujocoSoccerSim2Sim:
     def _get_joint_vel_isaac(self) -> np.ndarray:
         return self.data.qvel[self.joint_qvel_addr].astype(np.float32)
 
-    def _get_pelvis_world(self) -> tuple[np.ndarray, np.ndarray]:
-        return self.data.xpos[self.pelvis_body_id].astype(np.float32), self.data.xquat[self.pelvis_body_id].astype(np.float32)
+    def _get_root_world(self) -> tuple[np.ndarray, np.ndarray]:
+        return self.data.xpos[self.root_body_id].astype(np.float32), self.data.xquat[self.root_body_id].astype(np.float32)
+
+    def _get_soccer_obs_world(self) -> tuple[np.ndarray, np.ndarray]:
+        return (
+            self.data.xpos[self.soccer_obs_body_id].astype(np.float32),
+            self.data.xquat[self.soccer_obs_body_id].astype(np.float32),
+        )
 
     def _get_ball_world(self) -> tuple[np.ndarray, np.ndarray]:
         pos = self.data.qpos[self.ball_qpos_addr : self.ball_qpos_addr + 3].astype(np.float32)
@@ -608,26 +744,151 @@ class MujocoSoccerSim2Sim:
             f"goal_noise={self.current_goal_noise_vec.tolist()}"
         )
 
+    def _stale_ball_enabled(self) -> bool:
+        return self.args.stale_ball_start_step >= 0 and self.args.stale_ball_duration_steps > 0
+
+    def _stale_ball_active(self) -> bool:
+        if not self._stale_ball_enabled():
+            return False
+        start = self.args.stale_ball_start_step
+        end = start + self.args.stale_ball_duration_steps
+        return start <= self.policy_step_count < end
+
+    def _apply_stale_ball_observation(self, ball_local: np.ndarray) -> np.ndarray:
+        self.current_stale_ball_active = self._stale_ball_active()
+        if not self.current_stale_ball_active:
+            self.last_visible_ball_local = ball_local.astype(np.float32).copy()
+            self.stale_ball_local = None
+            return ball_local
+
+        if self.stale_ball_local is None:
+            self.stale_ball_local = self.last_visible_ball_local.astype(np.float32).copy()
+            print(
+                "[INFO] Stale ball observation starts | "
+                f"step={self.policy_step_count} frozen_ball_local={self.stale_ball_local.tolist()}"
+            )
+        return self.stale_ball_local.astype(np.float32)
+
+    def _maybe_log_stale_ball(self, action: np.ndarray) -> None:
+        if not self.current_stale_ball_active:
+            return
+        if self.policy_step_count % max(1, self.args.stale_ball_print_interval) != 0:
+            return
+        error = self.current_obs_ball_local - self.current_true_ball_local
+        print(
+            "[INFO] Stale ball obs | "
+            f"step={self.policy_step_count} "
+            f"true_ball={np.round(self.current_true_ball_local, 3).tolist()} "
+            f"obs_ball={np.round(self.current_obs_ball_local, 3).tolist()} "
+            f"obs_minus_true={np.round(error, 3).tolist()} "
+            f"action_norm={float(np.linalg.norm(action)):.3f} "
+            f"action_max_abs={float(np.max(np.abs(action))):.3f} "
+            f"action_head={np.round(action[:6], 3).tolist()}"
+        )
+
+    def _refresh_goal_anchor(self) -> None:
+        soccer_obs_pos_w, soccer_obs_quat_w = self._get_soccer_obs_world()
+        ball_pos_w, _ = self._get_ball_world()
+        yaw = yaw_from_quat_wxyz(soccer_obs_quat_w)
+        self.goal_anchor_heading_quat = quat_from_yaw_wxyz(yaw)
+
+        if self.args.ball_to_goal_anchor_source == "world_at_start":
+            world_vec = self.goal_world - ball_pos_w
+            self.active_ball_to_goal_anchor = quat_rotate_inverse_wxyz(
+                self.goal_anchor_heading_quat,
+                world_vec,
+            ).astype(np.float32)
+        else:
+            self.active_ball_to_goal_anchor = self.ball_to_goal_anchor.astype(np.float32).copy()
+
+        if self.args.goal_local_mode == "ball_anchor":
+            self.goal_marker_world = self._compute_goal_world_from_ball_anchor(ball_pos_w)
+        else:
+            self.goal_marker_world = self.goal_world.astype(np.float32).copy()
+        if self.args.goal_local_mode == "ball_anchor":
+            print(
+                "[INFO] Goal local ball-anchor latched | "
+                f"source={self.args.ball_to_goal_anchor_source} "
+                f"soccer_obs_body={self.soccer_obs_body_name} "
+                f"soccer_obs_pos_w={np.round(soccer_obs_pos_w, 4).tolist()} "
+                f"soccer_obs_yaw={yaw:.4f} "
+                f"ball_to_goal_anchor={np.round(self.active_ball_to_goal_anchor, 4).tolist()} "
+                f"virtual_goal_world={np.round(self.goal_marker_world, 4).tolist()}"
+            )
+
+    def _compute_goal_world_from_ball_anchor(self, ball_pos_w: np.ndarray) -> np.ndarray:
+        ball_to_goal_w = quat_rotate_wxyz(self.goal_anchor_heading_quat, self.active_ball_to_goal_anchor)
+        return (ball_pos_w + ball_to_goal_w).astype(np.float32)
+
+    def _compute_goal_local(
+        self,
+        root_pos_w: np.ndarray,
+        root_quat_w: np.ndarray,
+        ball_pos_w: np.ndarray,
+    ) -> np.ndarray:
+        if self.args.goal_local_mode == "ball_anchor":
+            self.goal_marker_world = self._compute_goal_world_from_ball_anchor(ball_pos_w)
+            return quat_rotate_inverse_wxyz(root_quat_w, self.goal_marker_world - root_pos_w).astype(np.float32)
+
+        self.goal_marker_world = self.goal_world.astype(np.float32).copy()
+        return quat_rotate_inverse_wxyz(root_quat_w, self.goal_world - root_pos_w).astype(np.float32)
+
+    def _maybe_log_policy_local_targets(self) -> None:
+        if not self.args.print_policy_local_targets:
+            return
+        if self.policy_step_count % max(1, self.args.policy_local_target_print_interval) != 0:
+            return
+        print(
+            "[INFO] Policy local targets | "
+            f"step={self.policy_step_count} "
+            f"motion_idx={self.current_motion_idx} "
+            f"motion_name={self._current_motion_name()} "
+            f"soccer_obs_body={self.soccer_obs_body_name} "
+            f"soccer_obs_pos_w={np.round(self.current_root_pos_w, 3).tolist()} "
+            f"soccer_obs_quat_w={np.round(self.current_root_quat_w, 3).tolist()} "
+            f"goal_world={np.round(self.goal_world, 3).tolist()} "
+            f"goal_marker_world={np.round(self.goal_marker_world, 3).tolist()} "
+            f"goal_local_mode={self.args.goal_local_mode} "
+            f"goal_local={np.round(self.current_goal_local, 3).tolist()} "
+            f"ball_local_true={np.round(self.current_true_ball_local, 3).tolist()} "
+            f"ball_local_obs={np.round(self.current_obs_ball_local, 3).tolist()}"
+        )
+
+    def _get_policy_local_targets_now(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        root_pos_w, root_quat_w = self._get_soccer_obs_world()
+        ball_pos_w, _ = self._get_ball_world()
+        ball_local = quat_rotate_inverse_wxyz(root_quat_w, ball_pos_w - root_pos_w).astype(np.float32)
+        goal_local = self._compute_goal_local(root_pos_w, root_quat_w, ball_pos_w)
+        return ball_local, goal_local, root_pos_w.astype(np.float32), root_quat_w.astype(np.float32)
+
     def _build_obs(self) -> np.ndarray:
         ref = self._current_reference()
-        pelvis_pos_w, pelvis_quat_w = self._get_pelvis_world()
+        root_pos_w, root_quat_w = self._get_soccer_obs_world()
         ball_pos_w, ball_vel_w = self._get_ball_world()
+        self.current_root_pos_w = root_pos_w.astype(np.float32).copy()
+        self.current_root_quat_w = root_quat_w.astype(np.float32).copy()
 
         term_map: dict[str, np.ndarray] = {}
         term_map["command"] = np.concatenate((ref["joint_pos"], ref["joint_vel"]), axis=0).astype(np.float32)
-        term_map["projected_gravity"] = quat_rotate_inverse_wxyz(pelvis_quat_w, np.array([0.0, 0.0, -1.0], dtype=np.float32))
+        term_map["projected_gravity"] = quat_rotate_inverse_wxyz(root_quat_w, np.array([0.0, 0.0, -1.0], dtype=np.float32))
         term_map["motion_ref_ang_vel"] = ref["body_ang_vel_w"][self.anchor_body_index].astype(np.float32)
         term_map["base_ang_vel"] = self.data.qvel[3:6].astype(np.float32)
         term_map["joint_pos"] = (self._get_joint_pos_isaac() - self.default_joint_pos).astype(np.float32)
         term_map["joint_vel"] = self._get_joint_vel_isaac().astype(np.float32)
         term_map["actions"] = self.last_action.astype(np.float32)
 
-        ball_local = quat_rotate_inverse_wxyz(pelvis_quat_w, ball_pos_w - pelvis_pos_w)
-        goal_local = quat_rotate_inverse_wxyz(pelvis_quat_w, self.goal_world - pelvis_pos_w)
+        ball_local = quat_rotate_inverse_wxyz(root_quat_w, ball_pos_w - root_pos_w)
+        goal_local = self._compute_goal_local(root_pos_w, root_quat_w, ball_pos_w)
+        self._set_goal_marker_state()
+        self.current_true_ball_local = ball_local.astype(np.float32).copy()
         ball_speed_xy = float(np.linalg.norm(ball_vel_w[:2]))
         ball_local, goal_local = self._apply_soccer_observation_noise(ball_local, goal_local, ball_speed_xy)
+        ball_local = self._apply_stale_ball_observation(ball_local)
+        self.current_obs_ball_local = ball_local.astype(np.float32).copy()
+        self.current_goal_local = goal_local.astype(np.float32).copy()
         term_map["target_point_pos"] = ball_local.astype(np.float32)
         term_map["target_destination_pos_local"] = goal_local.astype(np.float32)
+        # term_map["target_destination_pos_local"] = np.array([5.0, 0.0, -0.48], dtype=np.float32)
 
         obs_terms: list[np.ndarray] = []
         missing = []
@@ -655,18 +916,20 @@ class MujocoSoccerSim2Sim:
         joint_pos = self._get_joint_pos_isaac()
         joint_vel = self._get_joint_vel_isaac()
         tau = (self.target_joint_pos - joint_pos) * self.joint_stiffness - joint_vel * self.joint_damping
-        return tau.astype(np.float32)
+        return np.clip(tau, -self.joint_effort_limit, self.joint_effort_limit).astype(np.float32)
 
     def _set_robot_state_from_reference(self):
         if self.multi_motion:
-            root_pos = self.policy.reference["body_pos_w"][self.current_motion_idx, 0, self.pelvis_body_index]
-            root_quat = self.policy.reference["body_quat_w"][self.current_motion_idx, 0, self.pelvis_body_index]
+            root_pos = self.policy.reference["body_pos_w"][self.current_motion_idx, 0, self.root_body_index]
+            root_quat = self.policy.reference["body_quat_w"][self.current_motion_idx, 0, self.root_body_index]
             joint_pos = self.policy.reference["joint_pos"][self.current_motion_idx, 0]
         else:
-            root_pos = self.policy.reference["body_pos_w"][0, self.pelvis_body_index]
-            root_quat = self.policy.reference["body_quat_w"][0, self.pelvis_body_index]
+            root_pos = self.policy.reference["body_pos_w"][0, self.root_body_index]
+            root_quat = self.policy.reference["body_quat_w"][0, self.root_body_index]
             joint_pos = self.policy.reference["joint_pos"][0]
 
+        root_pos = rotate_point_around_origin(root_pos, self.scene_rotation_origin, self.scene_yaw_quat)
+        root_quat = quat_mul_wxyz(self.scene_yaw_quat, root_quat).astype(np.float32)
         self.data.qpos[0:3] = root_pos
         self.data.qpos[3:7] = root_quat
         self.data.qpos[self.joint_qpos_addr] = joint_pos
@@ -679,11 +942,18 @@ class MujocoSoccerSim2Sim:
         self.data.qvel[self.ball_qvel_addr : self.ball_qvel_addr + 6] = 0.0
 
     def _set_goal_marker_state(self):
-        self.data.mocap_pos[self.goal_marker_mocap_id] = self.goal_world.astype(np.float32)
+        self.data.mocap_pos[self.goal_marker_mocap_id] = self.goal_marker_world.astype(np.float32)
         self.data.mocap_quat[self.goal_marker_mocap_id] = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
 
     def _select_motion_for_ball(self, ball_world_xy: np.ndarray) -> int:
-        selected = np.linalg.norm(self.final_anchor_positions[:, :2] - ball_world_xy[:2], axis=1).argmin()
+        ball_selection_world = np.asarray(ball_world_xy, dtype=np.float32)
+        if abs(self.scene_yaw) > 1e-8:
+            ball_selection_world = rotate_point_around_origin(
+                ball_selection_world,
+                self.scene_rotation_origin,
+                quat_inv_wxyz(self.scene_yaw_quat),
+            )
+        selected = np.linalg.norm(self.final_anchor_positions[:, :2] - ball_selection_world[:2], axis=1).argmin()
         return int(selected)
 
     def _current_motion_name(self) -> str:
@@ -704,10 +974,16 @@ class MujocoSoccerSim2Sim:
         self.kick_reset_countdown = None
         self.h_state, self.c_state = self._zero_recurrent_state()
         self.last_action[:] = 0.0
+        self.last_visible_ball_local[:] = 0.0
+        self.stale_ball_local = None
+        self.current_stale_ball_active = False
         self.initial_ball_planar_xy = self.ball_spawn_world[:2].copy()
+        self.goal_marker_world = self.goal_world.astype(np.float32).copy()
         mujoco.mj_resetData(self.model, self.data)
         self._set_robot_state_from_reference()
         self._set_ball_state(self.ball_spawn_world)
+        mujoco.mj_forward(self.model, self.data)
+        self._refresh_goal_anchor()
         self._set_goal_marker_state()
         mujoco.mj_forward(self.model, self.data)
 
@@ -729,6 +1005,9 @@ class MujocoSoccerSim2Sim:
         ball_world[2] = max(self.args.ball_radius, ball_world[2] + dz)
         self.ball_spawn_world = ball_world
         self._set_ball_state(ball_world)
+        if self.args.goal_local_mode == "ball_anchor":
+            self._refresh_goal_anchor()
+            self._set_goal_marker_state()
         mujoco.mj_forward(self.model, self.data)
         print(f"[INFO] Ball moved to {ball_world.tolist()}")
 
@@ -754,10 +1033,21 @@ class MujocoSoccerSim2Sim:
         self._arm_policy_start(preserve_ball_pose=True)
         self.policy_active = True
         self.waiting_for_manual_start = False
+        ball_local, goal_local, root_pos_w, root_quat_w = self._get_policy_local_targets_now()
         print(
             f"[INFO] Starting policy with motion_idx={self.current_motion_idx}, "
             f"motion_name={self._current_motion_name()}, goal={self.goal_world.tolist()}, "
             f"ball={self.ball_spawn_world.tolist()}"
+        )
+        print(
+            "[INFO] Starting policy local targets | "
+            f"motion_idx={self.current_motion_idx} "
+            f"motion_name={self._current_motion_name()} "
+            f"soccer_obs_body={self.soccer_obs_body_name} "
+            f"soccer_obs_pos_w={np.round(root_pos_w, 4).tolist()} "
+            f"soccer_obs_quat_w={np.round(root_quat_w, 4).tolist()} "
+            f"ball_local={np.round(ball_local, 4).tolist()} "
+            f"goal_local={np.round(goal_local, 4).tolist()}"
         )
 
     def _on_key(self, keycode: int):
@@ -782,17 +1072,35 @@ class MujocoSoccerSim2Sim:
     def reset(self):
         self.goal_world = self._sample_goal_world()
         self.ball_spawn_world = self._sample_ball_world()
+        if abs(self.scene_yaw) > 1e-8:
+            initial_motion_idx = np.linalg.norm(
+                self.final_anchor_positions[:, :2] - self.ball_spawn_world[:2],
+                axis=1,
+            ).argmin()
+            self.scene_rotation_origin = self.policy.reference[
+                "body_pos_w"
+            ][initial_motion_idx, 0, self.root_body_index].astype(np.float32)
+            self.goal_world = rotate_point_around_origin(
+                self.goal_world,
+                self.scene_rotation_origin,
+                self.scene_yaw_quat,
+            ).astype(np.float32)
+            self.ball_spawn_world = rotate_point_around_origin(
+                self.ball_spawn_world,
+                self.scene_rotation_origin,
+                self.scene_yaw_quat,
+            ).astype(np.float32)
         self.last_ball_speed_xy = 0.0
         self._arm_policy_start(preserve_ball_pose=False)
         self._enter_waiting_state()
 
     def _should_reset(self) -> bool:
-        pelvis_pos_w, _ = self._get_pelvis_world()
+        root_pos_w, _ = self._get_root_world()
         ball_pos_w, ball_vel_w = self._get_ball_world()
         ball_speed_xy = float(np.linalg.norm(ball_vel_w[:2]))
         self.last_ball_speed_xy = ball_speed_xy
 
-        if pelvis_pos_w[2] < self.args.fall_height_threshold:
+        if root_pos_w[2] < self.args.fall_height_threshold:
             return True
 
         if self.policy_step_count >= self.max_episode_steps:
@@ -815,6 +1123,9 @@ class MujocoSoccerSim2Sim:
 
     def run(self):
         with mujoco.viewer.launch_passive(self.model, self.data, key_callback=self._on_key) as viewer:
+            viewer.cam.distance = self.args.viewer_distance
+            viewer.cam.elevation = self.args.viewer_elevation
+            viewer.cam.azimuth = self.args.viewer_azimuth
             start = time.time()
             while viewer.is_running() and time.time() - start < self.args.simulation_duration:
                 step_start = time.time()
@@ -830,6 +1141,8 @@ class MujocoSoccerSim2Sim:
                     action, h_out, c_out = self.policy.act(
                         obs, self.time_step, self.current_motion_idx, self.h_state, self.c_state
                     )
+                    self._maybe_log_policy_local_targets()
+                    self._maybe_log_stale_ball(action)
                     self._apply_action(action)
                     self.h_state, self.c_state = h_out, c_out
                     self.time_step += 1
@@ -846,6 +1159,7 @@ class MujocoSoccerSim2Sim:
                     mujoco.mj_step(self.model, self.data)
                 else:
                     mujoco.mj_forward(self.model, self.data)
+                viewer.cam.lookat[:] = self.data.xpos[self.root_body_id] + np.array([0.0, 0.0, 0.25])
                 viewer.sync()
 
                 elapsed = time.time() - step_start

@@ -29,6 +29,12 @@ parser.add_argument(
     default=False,
     help="Export one ONNX model containing all motions from --motion_path. Uses motion_idx + time_step at runtime.",
 )
+parser.add_argument(
+    "--export_only",
+    action="store_true",
+    default=False,
+    help="Exit after exporting ONNX instead of entering the playback loop.",
+)
 
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -54,7 +60,9 @@ import glob
 import pathlib
 import torch
 
-from rsl_rl.runners import OnPolicyRunner
+import rsl_rl.runners.distillation_runner as rsl_distillation_runner_module
+import rsl_rl.runners.on_policy_runner as rsl_runner_module
+from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 
 from isaaclab.envs import (
     DirectMARLEnv,
@@ -75,6 +83,7 @@ from soccer.utils.exporter import (
     export_motion_policy_as_onnx,
     export_multi_motion_policy_as_onnx,
 )
+from soccer.utils.my_on_policy_runner import MotionDistillation, MotionStudentTeacherRecurrent
 
 def get_motion_files(motion_path: str) -> list[str]:
     """
@@ -102,14 +111,40 @@ def get_motion_files(motion_path: str) -> list[str]:
     else:
         raise ValueError(f"Invalid path: {motion_path}. Must be a file or directory.")
 
+
+def get_checkpoint_id(resume_path: str) -> str:
+    checkpoint_name = os.path.basename(resume_path)
+    checkpoint_stem = os.path.splitext(checkpoint_name)[0]
+    if checkpoint_stem.startswith("model_"):
+        return checkpoint_stem.split("_", 1)[1]
+    return checkpoint_stem
+
+
+def get_runner_class(class_name: str):
+    if class_name == "DistillationRunner":
+        return DistillationRunner
+    if class_name == "OnPolicyRunner":
+        return OnPolicyRunner
+    raise ValueError(f"Unsupported RSL-RL runner class: {class_name}")
+
+
+def register_custom_rsl_rl_classes():
+    rsl_runner_module.MotionDistillation = MotionDistillation
+    rsl_runner_module.MotionStudentTeacherRecurrent = MotionStudentTeacherRecurrent
+    rsl_distillation_runner_module.MotionDistillation = MotionDistillation
+    rsl_distillation_runner_module.MotionStudentTeacherRecurrent = MotionStudentTeacherRecurrent
+
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     """Play with RSL-RL agent."""
     agent_cfg: RslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
 
-    env_cfg.viewer.origin_type = None
+    env_cfg.viewer.eye = (1.8, 1.8, 1.2)
+    env_cfg.viewer.lookat = (0.0, 0.0, 0.7)
+    env_cfg.viewer.origin_type = "world"
     env_cfg.viewer.asset_name = None
+    env_cfg.viewer.body_name = None
 
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
@@ -168,6 +203,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
 
+    if hasattr(env_cfg.commands.motion, "debug_vis"):
+        env_cfg.commands.motion.debug_vis = True
+
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
@@ -190,14 +228,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env = multi_agent_to_single_agent(env)
 
     # wrap around environment for rsl-rl
-    env = RslRlVecEnvWrapper(env)
+    env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
     # load previously trained model
-    ppo_runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+    register_custom_rsl_rl_classes()
+    runner_class = get_runner_class(agent_cfg.class_name)
+    ppo_runner = runner_class(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
     ppo_runner.load(resume_path)
 
     # obtain the trained policy for inference
     policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)
+    obs_normalizer = getattr(ppo_runner, "obs_normalizer", None)
 
     # export policy to onnx/jit
     export_targets: list[tuple[str, str]] = []
@@ -226,16 +267,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     raise ValueError(f"Requested export motion '{name}' not found in {args_cli.motion_path}.")
                 export_targets.append((match, name))
 
-    if args_cli.export_motion_bundle:
+    export_motion_bundle = args_cli.export_motion_bundle or (
+        args_cli.motion_path is not None and args_cli.export_motion_name is None
+    )
+
+    if export_motion_bundle:
         if args_cli.motion_path is None:
             raise ValueError("--export_motion_bundle requires --motion_path.")
         export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
-        ckpt = args_cli.checkpoint.split('_')[1].split('.')[0]
+        ckpt = get_checkpoint_id(resume_path)
         filename = f"policy_{ckpt}_bundle.onnx"
         export_multi_motion_policy_as_onnx(
             env.unwrapped,
             ppo_runner.alg.policy,
-            normalizer=ppo_runner.obs_normalizer,
+            normalizer=obs_normalizer,
             path=export_model_dir,
             filename=filename,
         )
@@ -248,7 +293,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(f"[INFO]: Exported bundled multi-motion policy to: {os.path.join(export_model_dir, filename)}")
     elif export_targets:
         export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
-        ckpt = args_cli.checkpoint.split('_')[1].split('.')[0]
+        ckpt = get_checkpoint_id(resume_path)
 
         for motion_file, export_name in export_targets:
             export_stem = os.path.splitext(export_name)[0]
@@ -256,7 +301,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             export_motion_policy_as_onnx(
                 env.unwrapped,
                 ppo_runner.alg.policy,
-                normalizer=ppo_runner.obs_normalizer,
+                normalizer=obs_normalizer,
                 path=export_model_dir,
                 filename=filename,
                 motion_name=export_name,
@@ -269,11 +314,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             )
             print(f"[INFO]: Exported policy for {export_name} to: {os.path.join(export_model_dir, filename)}")
     else:
-        print("[INFO]: Skipping policy export (set --export_motion_name to enable export).")
+        print("[INFO]: Skipping policy export.")
+
+    if args_cli.export_only:
+        env.close()
+        return
     
     # reset environment
     # breakpoint()
-    obs, _ = env.get_observations()
+    obs_result = env.get_observations()
+    obs = obs_result[0] if isinstance(obs_result, tuple) else obs_result
     timestep = 0
     # simulate environment
     while simulation_app.is_running():
@@ -282,7 +332,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # agent stepping
             actions = policy(obs)
             # env stepping
-            obs, _, _, _ = env.step(actions)
+            obs = env.step(actions)[0]
         if args_cli.video:
             timestep += 1
             # Exit the play loop after recording one video

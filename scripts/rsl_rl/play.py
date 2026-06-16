@@ -43,7 +43,9 @@ import os
 import pathlib
 import torch
 
-from rsl_rl.runners import OnPolicyRunner
+import rsl_rl.runners.distillation_runner as rsl_distillation_runner_module
+import rsl_rl.runners.on_policy_runner as rsl_runner_module
+from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 
 from isaaclab.envs import (
     DirectMARLEnv,
@@ -60,6 +62,22 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 # Import extensions to set up environment tasks
 import soccer.tasks  # noqa: F401
 from soccer.utils.exporter import attach_onnx_metadata, export_motion_policy_as_onnx
+from soccer.utils.my_on_policy_runner import MotionDistillation, MotionStudentTeacherRecurrent
+
+
+def get_runner_class(class_name: str):
+    if class_name == "DistillationRunner":
+        return DistillationRunner
+    if class_name == "OnPolicyRunner":
+        return OnPolicyRunner
+    raise ValueError(f"Unsupported RSL-RL runner class: {class_name}")
+
+
+def register_custom_rsl_rl_classes():
+    rsl_runner_module.MotionDistillation = MotionDistillation
+    rsl_runner_module.MotionStudentTeacherRecurrent = MotionStudentTeacherRecurrent
+    rsl_distillation_runner_module.MotionDistillation = MotionDistillation
+    rsl_distillation_runner_module.MotionStudentTeacherRecurrent = MotionStudentTeacherRecurrent
 
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
@@ -68,8 +86,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent_cfg: RslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
 
-    env_cfg.viewer.origin_type = None
-    env_cfg.viewer.asset_name = None
+    env_cfg.viewer.eye = (1.8, 1.8, 1.2)
+    env_cfg.viewer.asset_name = "robot"
+    env_cfg.viewer.origin_type = "asset_body" if env_cfg.viewer.body_name is not None else "asset_root"
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
     log_root_path = os.path.abspath(log_root_path)
@@ -139,11 +158,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env = RslRlVecEnvWrapper(env)
 
     # load previously trained model
-    ppo_runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+    register_custom_rsl_rl_classes()
+    runner_class = get_runner_class(agent_cfg.class_name)
+    ppo_runner = runner_class(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
     ppo_runner.load(resume_path)
 
     # obtain the trained policy for inference
     policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)
+    obs_normalizer = getattr(ppo_runner, "obs_normalizer", None)
 
     # export policy to onnx/jit
     export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
@@ -153,14 +175,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     export_motion_policy_as_onnx(
         env.unwrapped,
         ppo_runner.alg.policy,
-        normalizer=ppo_runner.obs_normalizer,
+        normalizer=obs_normalizer,
         path=export_model_dir,
         filename=filename,
     )
     attach_onnx_metadata(env.unwrapped, args_cli.wandb_path if args_cli.wandb_path else "none", export_model_dir, filename=filename)
     # reset environment
     # breakpoint()
-    obs, _ = env.get_observations()
+    obs_result = env.get_observations()
+    obs = obs_result[0] if isinstance(obs_result, tuple) else obs_result
     timestep = 0
     # simulate environment
     while simulation_app.is_running():
@@ -169,7 +192,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # agent stepping
             actions = policy(obs)
             # env stepping
-            obs, _, _, _ = env.step(actions)
+            obs = env.step(actions)[0]
         if args_cli.video:
             timestep += 1
             # Exit the play loop after recording one video

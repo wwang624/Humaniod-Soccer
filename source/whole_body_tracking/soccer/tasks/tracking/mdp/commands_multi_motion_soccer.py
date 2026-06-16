@@ -30,17 +30,56 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
 
+LEGACY_G1_30_BODY_NAMES = (
+    "pelvis",
+    "left_hip_pitch_link",
+    "right_hip_pitch_link",
+    "waist_yaw_link",
+    "left_hip_roll_link",
+    "right_hip_roll_link",
+    "waist_roll_link",
+    "left_hip_yaw_link",
+    "right_hip_yaw_link",
+    "torso_link",
+    "left_knee_link",
+    "right_knee_link",
+    "left_shoulder_pitch_link",
+    "right_shoulder_pitch_link",
+    "left_ankle_pitch_link",
+    "right_ankle_pitch_link",
+    "left_shoulder_roll_link",
+    "right_shoulder_roll_link",
+    "left_ankle_roll_link",
+    "right_ankle_roll_link",
+    "left_shoulder_yaw_link",
+    "right_shoulder_yaw_link",
+    "left_elbow_link",
+    "right_elbow_link",
+    "left_wrist_roll_link",
+    "right_wrist_roll_link",
+    "left_wrist_pitch_link",
+    "right_wrist_pitch_link",
+    "left_wrist_yaw_link",
+    "right_wrist_yaw_link",
+)
+
+
 class MultiMotionLoader:
-    def __init__(self, motion_files: list[str], body_indexes: Sequence[int], device: str = "cpu"):
+    def __init__(
+        self,
+        motion_files: list[str],
+        robot_body_indexes: Sequence[int],
+        body_names: Sequence[str],
+        device: str = "cpu",
+    ):
         assert len(motion_files) > 0, "motion_files must not be empty"
         self.num_files = len(motion_files)
-        self._body_indexes = body_indexes
+        self._robot_body_indexes = torch.as_tensor(robot_body_indexes, device="cpu", dtype=torch.long)
+        self._body_names = list(body_names)
         self.device = device
 
-        # Temporarily store data from each file.
         self.motion_name = []
         self.motion_lengths = []
-
         joint_pos_list = []
         joint_vel_list = []
         body_pos_w_list = []
@@ -48,32 +87,32 @@ class MultiMotionLoader:
         body_lin_vel_w_list = []
         body_ang_vel_w_list = []
         kick_leg_labels = []
-
         self.fps_list = []
-
-        max_T = 0  # Track maximum frame count.
+        max_T = 0
 
         for motion_file in motion_files:
             assert os.path.isfile(motion_file), f"Invalid file path: {motion_file}"
-            data = np.load(motion_file)
+            data = np.load(motion_file, allow_pickle=True)
 
             self.fps_list.append(data["fps"])
-            self.motion_name.append(motion_file.split("/")[-1].split(".")[0])  # Store filename without suffix.
+            self.motion_name.append(motion_file.split("/")[-1].split(".")[0])
             self.motion_lengths.append(data["joint_pos"].shape[0])
+            motion_body_indexes = self._resolve_motion_body_indexes(data, motion_file)
+            self._validate_motion_body_mapping(data, motion_file, motion_body_indexes)
 
             jp = torch.tensor(data["joint_pos"], dtype=torch.float32, device=device)
             jv = torch.tensor(data["joint_vel"], dtype=torch.float32, device=device)
-            bp = torch.tensor(data["body_pos_w"], dtype=torch.float32, device=device)
-            bq = torch.tensor(data["body_quat_w"], dtype=torch.float32, device=device)
-            blv = torch.tensor(data["body_lin_vel_w"], dtype=torch.float32, device=device)
-            bav = torch.tensor(data["body_ang_vel_w"], dtype=torch.float32, device=device)
+            bp_raw = torch.tensor(data["body_pos_w"], dtype=torch.float32, device=device)
+            bq_raw = torch.tensor(data["body_quat_w"], dtype=torch.float32, device=device)
+            blv_raw = torch.tensor(data["body_lin_vel_w"], dtype=torch.float32, device=device)
+            bav_raw = torch.tensor(data["body_ang_vel_w"], dtype=torch.float32, device=device)
 
             joint_pos_list.append(jp)
             joint_vel_list.append(jv)
-            body_pos_w_list.append(bp)
-            body_quat_w_list.append(bq)
-            body_lin_vel_w_list.append(blv)
-            body_ang_vel_w_list.append(bav)
+            body_pos_w_list.append(bp_raw[:, motion_body_indexes])
+            body_quat_w_list.append(bq_raw[:, motion_body_indexes])
+            body_lin_vel_w_list.append(blv_raw[:, motion_body_indexes])
+            body_ang_vel_w_list.append(bav_raw[:, motion_body_indexes])
 
             label_value: str | None = None
             if "kick_leg" in data.files:
@@ -85,19 +124,15 @@ class MultiMotionLoader:
                 if label_str in {"left", "right"}:
                     label_value = label_str
             kick_leg_labels.append(label_value)
-
             max_T = max(max_T, jp.shape[0])
 
-        # Pad all files to max_T and stack into tensors.
         def pad_tensor_list(tensor_list, pad_value=0.0):
             padded = []
             for t in tensor_list:
                 T, *rest = t.shape
                 pad_size = [max_T - T] + rest
-                pad_tensor = torch.cat([t, torch.full([*pad_size], pad_value, device=self.device)], dim=0)
-                # pad_tensor = torch.cat([t, torch.full([*pad_size], pad_value, device=self.device, dtype=t.dtype)], dim=0)
-                padded.append(pad_tensor)
-            return torch.stack(padded, dim=0)  # shape: (num_files, max_T, ...)
+                padded.append(torch.cat([t, torch.full([*pad_size], pad_value, device=self.device)], dim=0))
+            return torch.stack(padded, dim=0)
 
         self.joint_pos = pad_tensor_list(joint_pos_list)
         self.joint_vel = pad_tensor_list(joint_vel_list)
@@ -106,37 +141,99 @@ class MultiMotionLoader:
         self._body_lin_vel_w = pad_tensor_list(body_lin_vel_w_list)
         self._body_ang_vel_w = pad_tensor_list(body_ang_vel_w_list)
 
-        self.time_step_total = max_T  # Maximum frame count.
-        self.file_lengths = torch.tensor([jp.shape[0] for jp in joint_pos_list],
-                                         dtype=torch.long,
-                                         device=self.device)
-        self.fps = self.fps_list[0]  # Can be adjusted if needed.
+        body_count = int(self._body_pos_w.shape[2])
+        for name, tensor in (
+            ("body_quat_w", self._body_quat_w),
+            ("body_lin_vel_w", self._body_lin_vel_w),
+            ("body_ang_vel_w", self._body_ang_vel_w),
+        ):
+            if int(tensor.shape[2]) != body_count:
+                raise ValueError(
+                    f"Motion {name} body_count={int(tensor.shape[2])} does not match body_pos_w body_count={body_count}."
+                )
+
+        self.time_step_total = max_T
+        self.file_lengths = torch.tensor(
+            [jp.shape[0] for jp in joint_pos_list],
+            dtype=torch.long,
+            device=self.device,
+        )
+        self.fps = self.fps_list[0]
         self._kick_leg_labels = tuple(kick_leg_labels)
+
+    def _resolve_motion_body_indexes(self, data: np.lib.npyio.NpzFile, motion_file: str) -> list[int]:
+        raw_body_count = int(data["body_pos_w"].shape[1])
+        if "body_names" in data.files:
+            motion_body_names = [str(name) for name in data["body_names"].tolist()]
+            name_to_index = {name: idx for idx, name in enumerate(motion_body_names)}
+            missing = [name for name in self._body_names if name not in name_to_index]
+            if missing:
+                raise ValueError(
+                    f"Motion file {motion_file} is missing tracking bodies {missing}. "
+                    f"Available motion bodies: {motion_body_names}"
+                )
+            return [name_to_index[name] for name in self._body_names]
+
+        max_body_index = int(self._robot_body_indexes.max().item()) if self._robot_body_indexes.numel() > 0 else -1
+        if max_body_index >= raw_body_count:
+            legacy_name_to_index = {name: idx for idx, name in enumerate(LEGACY_G1_30_BODY_NAMES)}
+            if raw_body_count == len(LEGACY_G1_30_BODY_NAMES) and all(
+                name in legacy_name_to_index for name in self._body_names
+            ):
+                print(
+                    "[WARN] Motion file has no body_names metadata; using legacy G1 30-body mapping for "
+                    f"{motion_file}. Regenerate the npz with body_names metadata when possible."
+                )
+                return [legacy_name_to_index[name] for name in self._body_names]
+            raise ValueError(
+                "Motion file has no body_names metadata and robot body indexes cannot be used safely: "
+                f"max robot body index={max_body_index}, motion body_count={raw_body_count}, "
+                f"requested body_names={self._body_names}, motion_file={motion_file}. "
+                "Regenerate this motion npz with body_names metadata."
+            )
+        return self._robot_body_indexes.tolist()
+
+    def _validate_motion_body_mapping(
+        self, data: np.lib.npyio.NpzFile, motion_file: str, motion_body_indexes: Sequence[int]
+    ) -> None:
+        if "base_link" not in self._body_names or "torso_link" not in self._body_names:
+            return
+        base_idx = motion_body_indexes[self._body_names.index("base_link")]
+        torso_idx = motion_body_indexes[self._body_names.index("torso_link")]
+        body_pos = data["body_pos_w"]
+        base_z = float(body_pos[0, base_idx, 2])
+        torso_z = float(body_pos[0, torso_idx, 2])
+        if torso_z < base_z - 0.3:
+            raise ValueError(
+                f"Motion body_names mapping looks invalid for {motion_file}: "
+                f"base_link z={base_z:.3f}, torso_link z={torso_z:.3f}. "
+                "Regenerate the motion npz with body_names written by scripts/saya_video2robot_pkl_to_npz.py "
+                "from the same IsaacLab/IsaacSim asset used for training."
+            )
 
     @property
     def body_pos_w(self) -> torch.Tensor:
-        return self._body_pos_w[:, :, self._body_indexes]
+        return self._body_pos_w
 
     @property
     def body_quat_w(self) -> torch.Tensor:
-        return self._body_quat_w[:, :, self._body_indexes]
+        return self._body_quat_w
 
     @property
     def body_lin_vel_w(self) -> torch.Tensor:
-        return self._body_lin_vel_w[:, :, self._body_indexes]
+        return self._body_lin_vel_w
 
     @property
     def body_ang_vel_w(self) -> torch.Tensor:
-        return self._body_ang_vel_w[:, :, self._body_indexes]
+        return self._body_ang_vel_w
 
     @property
     def kick_leg_labels(self) -> tuple[str | None, ...]:
         return self._kick_leg_labels
-    
+
     def get_last_frame_anchor_pos(self, motion_idx: int, anchor_body_idx: int, motion_length: int) -> torch.Tensor:
         """Get the anchor position at the last frame of the specified motion."""
-        last_frame_idx = motion_length - 1
-        return self._body_pos_w[motion_idx, last_frame_idx, anchor_body_idx]
+        return self._body_pos_w[motion_idx, motion_length - 1, anchor_body_idx]
 
     def get_first_frame_anchor_pos(self, motion_idx: int, anchor_body_idx: int) -> torch.Tensor:
         """Get the anchor position at the first frame of the specified motion."""
@@ -173,11 +270,57 @@ class MotionCommand(CommandTerm):
 
         self.robot_anchor_body_index = self.robot.body_names.index(self.cfg.anchor_body_name)
         self.motion_anchor_body_index = self.cfg.body_names.index(self.cfg.anchor_body_name)
+        soccer_obs_body_name = self.cfg.soccer_obs_body_name
+        if soccer_obs_body_name is None:
+            soccer_obs_body_name = next(
+                (name for name in ("pelvis", "base_link") if name in self.robot.body_names),
+                self.cfg.anchor_body_name,
+            )
+        if soccer_obs_body_name not in self.robot.body_names:
+            raise ValueError(
+                f"soccer_obs_body_name={soccer_obs_body_name!r} is not in robot bodies. "
+                f"Available bodies: {self.robot.body_names}"
+            )
+        self.soccer_obs_body_name = soccer_obs_body_name
+        self.robot_soccer_obs_body_index = self.robot.body_names.index(soccer_obs_body_name)
+        self.motion_left_foot_body_index = (
+            self.cfg.body_names.index("left_ankle_roll_link") if "left_ankle_roll_link" in self.cfg.body_names else None
+        )
+        self.motion_right_foot_body_index = (
+            self.cfg.body_names.index("right_ankle_roll_link") if "right_ankle_roll_link" in self.cfg.body_names else None
+        )
         self.body_indexes = torch.tensor(
             self.robot.find_bodies(self.cfg.body_names, preserve_order=True)[0], dtype=torch.long, device=self.device
         )
+        if len(self.body_indexes) != len(self.cfg.body_names):
+            raise ValueError(
+                "Failed to resolve all tracking bodies. "
+                f"requested={self.cfg.body_names}, resolved_indexes={self.body_indexes.detach().cpu().tolist()}, "
+                f"robot_body_names={self.robot.body_names}"
+            )
+        max_robot_body_index = int(self.body_indexes.max().item()) if len(self.body_indexes) > 0 else -1
+        robot_body_count = len(self.robot.body_names)
+        if max_robot_body_index >= robot_body_count:
+            raise ValueError(
+                "Robot body index out of range: "
+                f"max requested body index={max_robot_body_index}, robot body_count={robot_body_count}, "
+                f"body_indexes={self.body_indexes.detach().cpu().tolist()}, robot_body_names={self.robot.body_names}"
+            )
 
-        self.motion = MultiMotionLoader(self.cfg.motion_files, self.body_indexes, device=self.device)
+        self.motion = MultiMotionLoader(
+            self.cfg.motion_files,
+            self.body_indexes,
+            self.cfg.body_names,
+            device=self.device,
+        )
+        motion_joint_dim = int(self.motion.joint_pos.shape[-1])
+        robot_joint_dim = int(self.robot.data.joint_pos.shape[-1])
+        if motion_joint_dim != robot_joint_dim:
+            raise ValueError(
+                "Motion joint dimension does not match robot joint dimension: "
+                f"motion_joint_dim={motion_joint_dim}, robot_joint_dim={robot_joint_dim}, "
+                f"robot_joint_names={self.robot.joint_names}, motion_files={self.cfg.motion_files}"
+            )
         kick_leg_to_id = {"left": 0, "right": 1}
         self._kick_leg_id_to_name = {v: k for k, v in kick_leg_to_id.items()}
         self._kick_leg_id_to_name[-1] = "unknown"
@@ -247,9 +390,9 @@ class MotionCommand(CommandTerm):
         self.destination_height = 0.11
         
         # target_destination generation parameters (world-frame based).
-        self.destination_center = torch.tensor([0.0, -5.0, self.destination_height], device=self.device)  # Rectangle center (x, y, z).
-        self.destination_length = 1.0  # Rectangle length (x-axis).
-        self.destination_width = 0.5  # Rectangle width (y-axis).
+        self.destination_center = torch.tensor(self.cfg.destination_center, dtype=torch.float32, device=self.device)
+        self.destination_length = float(self.cfg.destination_length)
+        self.destination_width = float(self.cfg.destination_width)
         
         self.curve_radius_offset = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
         self._radius_offset_min = None
@@ -275,6 +418,7 @@ class MotionCommand(CommandTerm):
         self._compute_soccer_ball_positions(all_env_ids)
         self._update_soccer_ball(all_env_ids)
         self._update_target_points(all_env_ids)
+        self._update_destination_points(all_env_ids)
 
     @property
     def command(self) -> torch.Tensor:
@@ -354,13 +498,19 @@ class MotionCommand(CommandTerm):
 
     @property
     def robot_pelvis_pos_w(self) -> torch.Tensor:
-        pelvis_index = self.robot.body_names.index("pelvis")
-        return self.robot.data.body_pos_w[:, pelvis_index]
+        return self.robot_soccer_obs_pos_w
     
     @property
     def robot_pelvis_quat_w(self) -> torch.Tensor:
-        pelvis_index = self.robot.body_names.index("pelvis")
-        return self.robot.data.body_quat_w[:, pelvis_index]
+        return self.robot_soccer_obs_quat_w
+
+    @property
+    def robot_soccer_obs_pos_w(self) -> torch.Tensor:
+        return self.robot.data.body_pos_w[:, self.robot_soccer_obs_body_index]
+
+    @property
+    def robot_soccer_obs_quat_w(self) -> torch.Tensor:
+        return self.robot.data.body_quat_w[:, self.robot_soccer_obs_body_index]
 
     @property
     def robot_anchor_lin_vel_w(self) -> torch.Tensor:
@@ -538,18 +688,32 @@ class MotionCommand(CommandTerm):
 
         arc_limit = float(self._target_arc_angle)
         base_height = float(self._target_height)
+        placement_mode = str(getattr(self.cfg, "ball_placement_mode", "anchor_final")).lower()
+        contact_phase = float(getattr(self.cfg, "ball_contact_phase", 1.0))
 
         for env_id in ids:
             motion_idx = int(self.motion_idx[env_id].item())
             motion_len = max(1, int(self.motion_length[env_id].item()))
 
             first_anchor = self.motion.get_first_frame_anchor_pos(motion_idx, self.motion_anchor_body_index,)
-            last_anchor = self.motion.get_last_frame_anchor_pos(motion_idx, self.motion_anchor_body_index, motion_len,)
+            if placement_mode == "kick_foot":
+                leg = int(self.motion_kick_leg[motion_idx].item())
+                if leg == 0 and self.motion_left_foot_body_index is not None:
+                    target_body_index = self.motion_left_foot_body_index
+                elif leg == 1 and self.motion_right_foot_body_index is not None:
+                    target_body_index = self.motion_right_foot_body_index
+                else:
+                    target_body_index = self.motion_anchor_body_index
+                target_step = int(round((motion_len - 1) * contact_phase))
+                target_step = max(0, min(motion_len - 1, target_step))
+                target_body_pos = self.motion.body_pos_w[motion_idx, target_step, target_body_index]
+            elif placement_mode == "anchor_final":
+                target_body_pos = self.motion.get_last_frame_anchor_pos(motion_idx, self.motion_anchor_body_index, motion_len,)
+            else:
+                raise ValueError(f"Unsupported ball_placement_mode: {self.cfg.ball_placement_mode}")
 
-            radius_vec = last_anchor[:2] - first_anchor[:2]
+            radius_vec = target_body_pos[:2] - first_anchor[:2]
             radius_sq = torch.dot(radius_vec, radius_vec)
-            target_xy = last_anchor[:2]
-
             radius = torch.sqrt(radius_sq) if float(radius_sq) > 1e-12 else torch.tensor(0.0, device=self.device)
             if float(radius_sq) > 1e-12:
                 base_direction = radius_vec / radius
@@ -616,12 +780,22 @@ class MotionCommand(CommandTerm):
         ids = self._to_env_id_tensor(env_ids)
         if ids.numel() == 0:
             return
-        
-        # Generate target_destination in world coordinates.
-        # Sample destination uniformly within the rectangle.
-        rand_x = (torch.rand(ids.numel(), device=self.device) - 0.5) * self.destination_length
-        rand_y = (torch.rand(ids.numel(), device=self.device) - 0.5) * self.destination_width
-        destination = self.destination_center.expand(ids.numel(), -1) + torch.stack([rand_x, rand_y, torch.zeros_like(rand_x)], dim=1)
+
+        destination_mode = str(getattr(self.cfg, "destination_mode", "rectangle")).lower()
+        if destination_mode in {"ball_anchor", "ball_to_goal", "ball_to_goal_anchor"}:
+            ball_to_goal = torch.tensor(
+                self.cfg.ball_to_goal_vector, dtype=torch.float32, device=self.device
+            ).view(1, 3)
+            destination = self.initial_target_point_pos[ids] + ball_to_goal
+        elif destination_mode == "rectangle":
+            # Generate target_destination in env-local/world coordinates from a fixed rectangle.
+            rand_x = (torch.rand(ids.numel(), device=self.device) - 0.5) * self.destination_length
+            rand_y = (torch.rand(ids.numel(), device=self.device) - 0.5) * self.destination_width
+            destination = self.destination_center.expand(ids.numel(), -1) + torch.stack(
+                [rand_x, rand_y, torch.zeros_like(rand_x)], dim=1
+            )
+        else:
+            raise ValueError(f"Unsupported destination_mode: {self.cfg.destination_mode}")
         self.target_destination_pos[ids] = destination
 
         if self.target_destination_marker is not None:
@@ -708,6 +882,35 @@ class MotionCommand(CommandTerm):
         root_pos[env_ids] += rand_samples[:, 0:3]
         orientations_delta = quat_from_euler_xyz(rand_samples[:, 3], rand_samples[:, 4], rand_samples[:, 5])
         root_ori[env_ids] = quat_mul(orientations_delta, root_ori[env_ids])
+        if getattr(self.cfg, "rotate_soccer_targets_with_root_yaw", False):
+            yaw_delta = yaw_quat(orientations_delta)
+            env_origins = getattr(self._env.scene, "env_origins", None)
+            if env_origins is not None:
+                anchor_origin = root_pos[env_ids] - env_origins[env_ids]
+            else:
+                anchor_origin = root_pos[env_ids].clone()
+            anchor_origin[:, 2] = 0.0
+
+            def rotate_targets(points: torch.Tensor) -> torch.Tensor:
+                rotated = points.clone()
+                rel = rotated[env_ids] - anchor_origin
+                rel[:, 2] = 0.0
+                rotated_xy = anchor_origin + quat_apply(yaw_delta, rel)
+                rotated[env_ids, :2] = rotated_xy[:, :2]
+                return rotated
+
+            self.soccer_ball_pos = rotate_targets(self.soccer_ball_pos)
+            self.target_point_pos = rotate_targets(self.target_point_pos)
+            self.initial_target_point_pos = rotate_targets(self.initial_target_point_pos)
+            self.target_destination_pos = rotate_targets(self.target_destination_pos)
+            self._update_soccer_ball(env_ids)
+            if self.target_destination_marker is not None:
+                env_origins = getattr(self._env.scene, "env_origins", None)
+                if env_origins is not None:
+                    world_destination = self.target_destination_pos + env_origins
+                else:
+                    world_destination = self.target_destination_pos
+                self.target_destination_marker.visualize(world_destination)
         range_list = [self.cfg.velocity_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z", "roll", "pitch", "yaw"]]
         ranges = torch.tensor(range_list, device=self.device)
         rand_samples = sample_uniform(ranges[:, 0], ranges[:, 1], (len(env_ids), 6), device=self.device)
@@ -836,6 +1039,7 @@ class MotionCommandCfg(CommandTermCfg):
     motion_files: list[str] = MISSING
 
     anchor_body_name: str = MISSING
+    soccer_obs_body_name: str | None = None
     body_names: list[str] = MISSING
 
     pose_range: dict[str, tuple[float, float]] = {}
@@ -868,3 +1072,14 @@ class MotionCommandCfg(CommandTermCfg):
     # Blind-zone config: ball is invisible when robot-ball (x, y) distance is outside [min, max].
     blind_distance_min_range: tuple[float, float] = (0.3, 0.5)  # Minimum distance sampling range.
     blind_distance_max_range: tuple[float, float] = (1.5, 2.0)  # Maximum distance sampling range.
+    destination_center: tuple[float, float, float] = (0.0, -5.0, 0.11)
+    destination_length: float = 1.0
+    destination_width: float = 0.5
+    destination_mode: str = "rectangle"
+    ball_to_goal_vector: tuple[float, float, float] = (0.0, -5.0, 0.0)
+    ball_placement_mode: str = "anchor_final"
+    ball_contact_phase: float = 1.0
+    rotate_soccer_targets_with_root_yaw: bool = False
+    # Optional normalized motion-phase window in which ball contact is considered a valid kick.
+    # None preserves the legacy behavior where the first contact at any phase can receive kick rewards.
+    valid_contact_phase_range: tuple[float, float] | None = None
