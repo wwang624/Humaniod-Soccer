@@ -16,8 +16,14 @@ from soccer.utils.exporter import attach_onnx_metadata, export_motion_policy_as_
 class MotionStudentTeacherRecurrent(StudentTeacherRecurrent):
     """Recurrent student-teacher module with PPO recurrent-teacher checkpoint loading."""
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, teacher_uses_student_obs: bool | None = None, **kwargs):
         super().__init__(*args, **kwargs)
+        if teacher_uses_student_obs is None:
+            value = os.environ.get("SOCCER_TEACHER_USES_STUDENT_OBS", "0").strip().lower()
+            teacher_uses_student_obs = value in {"1", "true", "yes", "on"}
+        self.teacher_uses_student_obs = teacher_uses_student_obs
+        if self.teacher_uses_student_obs:
+            print("[INFO] MotionStudentTeacherRecurrent: teacher labels use the student policy observation tensor.")
         if self.teacher_recurrent:
             self.teacher_input_obs_normalizer = EmpiricalNormalization(self.memory_t.rnn.input_size)
         else:
@@ -102,6 +108,11 @@ class MotionStudentTeacherRecurrent(StudentTeacherRecurrent):
                 obs = self.memory_t(obs).squeeze(0)
             return self.teacher(obs)
 
+    def get_teacher_obs(self, obs):
+        if self.teacher_uses_student_obs:
+            return self.get_student_obs(obs)
+        return super().get_teacher_obs(obs)
+
     def train(self, mode=True):
         super().train(mode)
         self.teacher_input_obs_normalizer.eval()
@@ -110,11 +121,30 @@ class MotionStudentTeacherRecurrent(StudentTeacherRecurrent):
 class MotionDistillation(Distillation):
     """Distillation that rolls out the student mean action instead of noisy samples."""
 
+    def __init__(self, *args, freeze_student_obs_normalizer: bool | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        if freeze_student_obs_normalizer is None:
+            value = os.environ.get("SOCCER_FREEZE_STUDENT_OBS_NORMALIZER", "0").strip().lower()
+            freeze_student_obs_normalizer = value in {"1", "true", "yes", "on"}
+        self.freeze_student_obs_normalizer = freeze_student_obs_normalizer
+        if self.freeze_student_obs_normalizer:
+            print("[INFO] MotionDistillation: freezing student observation normalizer updates.")
+
     def act(self, obs):
         self.transition.actions = self.policy.act_inference(obs).detach()
         self.transition.privileged_actions = self.policy.evaluate(obs).detach()
         self.transition.observations = obs
         return self.transition.actions
+
+    def process_env_step(self, obs, rewards, dones, extras):
+        if not self.freeze_student_obs_normalizer:
+            self.policy.update_normalization(obs)
+
+        self.transition.rewards = rewards
+        self.transition.dones = dones
+        self.storage.add_transitions(self.transition)
+        self.transition.clear()
+        self.policy.reset(dones)
 
 
 class MyOnPolicyRunner(OnPolicyRunner):

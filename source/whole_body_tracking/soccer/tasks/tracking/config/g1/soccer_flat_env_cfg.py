@@ -447,5 +447,34 @@ class G1FlatSoccerStudentEnvCfg(G1FlatKickEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         student_obs = self.observations.policy.copy()
-        self.observations.teacher = self.observations.policy
+        teacher_obs = self.observations.policy.copy()
+        teacher_obs.enable_corruption = False
+        soccer_target_noise_params = {
+            "command_name": "motion",
+            "ball_noise_std": (0.03, 0.03, 0.02),
+            "goal_noise_std": (0.03, 0.03, 0.02),
+            "noise_type": "normal",
+            "update_interval": 2,
+            "dropout_prob": 0.10,
+            "hold_last": True,
+        }
+        # Keep the G1 student on the same soccer target cues as the teacher.
+        # Some config copies do not preserve terms added dynamically by _apply_soccer_obs().
+        student_obs.target_point_pos = ObsTerm(
+            func=mdp.noisy_target_point_pos,
+            params=soccer_target_noise_params,
+        )
+        student_obs.target_destination_pos_local = ObsTerm(
+            func=mdp.noisy_target_destination_pos_local,
+            params=soccer_target_noise_params,
+        )
+        teacher_obs.target_point_pos = ObsTerm(
+            func=mdp.constant_target_point_pos,
+            params={"command_name": "motion"},
+        )
+        teacher_obs.target_destination_pos_local = ObsTerm(
+            func=mdp.target_destination_pos_local,
+            params={"command_name": "motion"},
+        )
+        self.observations.teacher = teacher_obs
         self.observations.policy = student_obs

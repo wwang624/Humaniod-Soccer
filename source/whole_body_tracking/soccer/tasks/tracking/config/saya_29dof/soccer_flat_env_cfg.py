@@ -141,13 +141,24 @@ class Saya29DoFFlatSoccerStudentEnvCfg(Saya29DoFFlatKickEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         student_obs = self.observations.policy.copy()
+        teacher_obs = self.observations.policy.copy()
+        teacher_obs.enable_corruption = False
+        soccer_target_noise_params = {
+            "command_name": "motion",
+            "ball_noise_std": (0.03, 0.03, 0.02),
+            "goal_noise_std": (0.03, 0.03, 0.02),
+            "noise_type": "normal",
+            "update_interval": 2,
+            "dropout_prob": 0.10,
+            "hold_last": True,
+        }
         student_obs.target_point_pos = ObsTerm(
-            func=mdp.target_point_pos_first_frame,
-            params={"command_name": "motion"},
+            func=mdp.noisy_target_point_pos,
+            params=soccer_target_noise_params,
         )
         student_obs.target_destination_pos_local = ObsTerm(
-            func=mdp.target_destination_pos_local_ball_anchor_first_frame,
-            params={"command_name": "motion"},
+            func=mdp.noisy_target_destination_pos_local,
+            params=soccer_target_noise_params,
         )
-        self.observations.teacher = self.observations.policy
+        self.observations.teacher = teacher_obs
         self.observations.policy = student_obs

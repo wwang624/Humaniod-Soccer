@@ -177,6 +177,141 @@ def constant_target_point_pos(env: ManagerBasedEnv, command_name: str = "motion"
     return _positional_encoding(base, num_freqs=6)
 
 
+def _sample_target_noise(
+    clean: torch.Tensor,
+    noise_type: str,
+    noise_std: tuple[float, float, float],
+) -> torch.Tensor:
+    std = torch.as_tensor(noise_std, dtype=clean.dtype, device=clean.device).view(1, 3)
+    if torch.all(std <= 0):
+        return torch.zeros_like(clean)
+    if noise_type == "uniform":
+        return (torch.rand_like(clean) * 2.0 - 1.0) * std
+    if noise_type == "normal":
+        return torch.randn_like(clean) * std
+    raise ValueError(f"Unsupported soccer target noise_type: {noise_type}")
+
+
+def _noisy_soccer_target_pair(
+    env: ManagerBasedEnv,
+    command_name: str = "motion",
+    *,
+    ball_noise_std: tuple[float, float, float] = (0.03, 0.03, 0.02),
+    goal_noise_std: tuple[float, float, float] = (0.03, 0.03, 0.02),
+    noise_type: str = "normal",
+    update_interval: int = 2,
+    dropout_prob: float = 0.10,
+    hold_last: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return student perception targets with shared noise/dropout state.
+
+    The ball and goal observations use one cache so an artificial perception dropout
+    cannot update one target without the other. This keeps the observation contract
+    close to deployment: valid detections refresh the target, missed detections hold
+    the last valid target.
+    """
+    clean_ball = constant_target_point_pos(env, command_name)
+    clean_goal = target_destination_pos_local(env, command_name)
+    update_interval = max(int(update_interval), 1)
+    dropout_prob = float(min(max(dropout_prob, 0.0), 1.0))
+
+    cache_name = f"_{command_name}_noisy_soccer_target_cache"
+    cache = getattr(env, cache_name, None)
+    if cache is None or "step" not in cache or cache["ball"].shape[0] != env.num_envs:
+        cache = {
+            "ball": clean_ball.clone(),
+            "goal": clean_goal.clone(),
+            "step": torch.full((env.num_envs,), -1, dtype=torch.long, device=clean_ball.device),
+        }
+        setattr(env, cache_name, cache)
+
+    step_buf = getattr(env, "episode_length_buf", None)
+    if step_buf is None:
+        update_mask = torch.ones(env.num_envs, dtype=torch.bool, device=clean_ball.device)
+        first_step_mask = update_mask
+        common_step = int(getattr(env, "common_step_counter", 0))
+        current_step = torch.full((env.num_envs,), common_step, dtype=torch.long, device=clean_ball.device)
+    else:
+        current_step = step_buf.to(device=clean_ball.device, dtype=torch.long)
+        already_updated_mask = cache["step"] == current_step
+        if torch.all(already_updated_mask):
+            return cache["ball"], cache["goal"]
+        update_mask = (step_buf % update_interval) == 0
+        first_step_mask = step_buf == 0
+        update_mask = update_mask | first_step_mask
+        update_mask = update_mask & ~already_updated_mask
+
+    if not torch.any(update_mask):
+        return cache["ball"], cache["goal"]
+
+    valid_update_mask = update_mask.clone()
+    if dropout_prob > 0.0:
+        detected = torch.rand(env.num_envs, device=clean_ball.device) >= dropout_prob
+        valid_update_mask = update_mask & (detected | first_step_mask)
+
+    if not hold_last:
+        invalid_update_mask = update_mask & ~valid_update_mask
+        if torch.any(invalid_update_mask):
+            cache["ball"][invalid_update_mask] = clean_ball[invalid_update_mask]
+            cache["goal"][invalid_update_mask] = clean_goal[invalid_update_mask]
+
+    if torch.any(valid_update_mask):
+        noisy_ball = clean_ball + _sample_target_noise(clean_ball, noise_type, ball_noise_std)
+        noisy_goal = clean_goal + _sample_target_noise(clean_goal, noise_type, goal_noise_std)
+        cache["ball"][valid_update_mask] = noisy_ball[valid_update_mask]
+        cache["goal"][valid_update_mask] = noisy_goal[valid_update_mask]
+
+    cache["step"][update_mask] = current_step[update_mask]
+
+    return cache["ball"], cache["goal"]
+
+
+def noisy_target_point_pos(
+    env: ManagerBasedEnv,
+    command_name: str = "motion",
+    ball_noise_std: tuple[float, float, float] = (0.03, 0.03, 0.02),
+    goal_noise_std: tuple[float, float, float] = (0.03, 0.03, 0.02),
+    noise_type: str = "normal",
+    update_interval: int = 2,
+    dropout_prob: float = 0.10,
+    hold_last: bool = True,
+) -> torch.Tensor:
+    ball, _ = _noisy_soccer_target_pair(
+        env,
+        command_name,
+        ball_noise_std=ball_noise_std,
+        goal_noise_std=goal_noise_std,
+        noise_type=noise_type,
+        update_interval=update_interval,
+        dropout_prob=dropout_prob,
+        hold_last=hold_last,
+    )
+    return ball
+
+
+def noisy_target_destination_pos_local(
+    env: ManagerBasedEnv,
+    command_name: str = "motion",
+    ball_noise_std: tuple[float, float, float] = (0.03, 0.03, 0.02),
+    goal_noise_std: tuple[float, float, float] = (0.03, 0.03, 0.02),
+    noise_type: str = "normal",
+    update_interval: int = 2,
+    dropout_prob: float = 0.10,
+    hold_last: bool = True,
+) -> torch.Tensor:
+    _, goal = _noisy_soccer_target_pair(
+        env,
+        command_name,
+        ball_noise_std=ball_noise_std,
+        goal_noise_std=goal_noise_std,
+        noise_type=noise_type,
+        update_interval=update_interval,
+        dropout_prob=dropout_prob,
+        hold_last=hold_last,
+    )
+    return goal
+
+
 def blind_zone_target_point_pos(env: ManagerBasedEnv, command_name: str = "motion") -> torch.Tensor:
     """Return target point in robot base frame with blind-zone simulation.
     
