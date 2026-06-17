@@ -4,6 +4,7 @@ import math
 import torch
 from typing import TYPE_CHECKING
 
+from isaaclab.envs.mdp.observations import base_ang_vel, joint_pos_rel, joint_vel_rel, last_action, projected_gravity
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.math import (
     matrix_from_quat,
@@ -95,6 +96,79 @@ def motion_anchor_ang_vel(env: ManagerBasedEnv, command_name: str) -> torch.Tens
     command: MotionCommand = env.command_manager.get_term(command_name)
 
     return command.anchor_ang_vel_w.view(env.num_envs, -1)
+
+
+def motion_phase_sin_cos(env: ManagerBasedEnv, command_name: str = "motion") -> torch.Tensor:
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    time_steps = command.time_steps.to(dtype=torch.float32)
+    motion_length = getattr(command, "motion_length", None)
+    if motion_length is None:
+        total = float(getattr(command.motion, "time_step_total", 1))
+        denom = torch.full_like(time_steps, max(total - 1.0, 1.0))
+    else:
+        denom = torch.clamp(motion_length.to(dtype=torch.float32) - 1.0, min=1.0)
+    phase = torch.clamp(time_steps / denom, 0.0, 1.0)
+    angle = 2.0 * math.pi * phase
+    return torch.stack([torch.sin(angle), torch.cos(angle)], dim=-1)
+
+
+def policy_obs_history(
+    env: ManagerBasedEnv,
+    command_name: str = "motion",
+    history_length: int = 4,
+    use_noisy_targets: bool = False,
+    ball_noise_std: tuple[float, float, float] = (0.03, 0.03, 0.02),
+    goal_noise_std: tuple[float, float, float] = (0.03, 0.03, 0.02),
+    noise_type: str = "normal",
+    update_interval: int = 2,
+    dropout_prob: float = 0.10,
+    hold_last: bool = True,
+) -> torch.Tensor:
+    """Stack recent deployable proprioceptive and soccer observations for MLP students."""
+    history_length = max(int(history_length), 1)
+    if use_noisy_targets:
+        ball_local, goal_local = _noisy_soccer_target_pair(
+            env,
+            command_name,
+            ball_noise_std=ball_noise_std,
+            goal_noise_std=goal_noise_std,
+            noise_type=noise_type,
+            update_interval=update_interval,
+            dropout_prob=dropout_prob,
+            hold_last=hold_last,
+        )
+    else:
+        ball_local = constant_target_point_pos(env, command_name)
+        goal_local = target_destination_pos_local(env, command_name)
+    current = torch.cat(
+        [
+            projected_gravity(env),
+            base_ang_vel(env),
+            joint_pos_rel(env),
+            joint_vel_rel(env),
+            last_action(env),
+            ball_local,
+            goal_local,
+        ],
+        dim=-1,
+    )
+
+    cache_name = f"_{command_name}_policy_obs_history_cache"
+    cache = getattr(env, cache_name, None)
+    if cache is None or cache.shape[0] != env.num_envs or cache.shape[1] != history_length or cache.shape[2] != current.shape[-1]:
+        cache = current.unsqueeze(1).repeat(1, history_length, 1)
+        setattr(env, cache_name, cache)
+
+    step_buf = getattr(env, "episode_length_buf", None)
+    if step_buf is not None:
+        reset_mask = step_buf.to(device=current.device) == 0
+        if torch.any(reset_mask):
+            cache[reset_mask] = current[reset_mask].unsqueeze(1).repeat(1, history_length, 1)
+
+    cache = torch.roll(cache, shifts=-1, dims=1)
+    cache[:, -1] = current
+    setattr(env, cache_name, cache)
+    return cache.reshape(env.num_envs, -1)
 
 
 def _get_motion_command(env: ManagerBasedEnv, command_name: str) -> MotionCommand:

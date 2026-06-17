@@ -71,7 +71,12 @@ from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 
 # Import extensions to set up environment tasks
 import soccer.tasks  # noqa: F401
-from soccer.utils.my_on_policy_runner import MotionDistillation, MotionStudentTeacherRecurrent
+from soccer.utils.my_on_policy_runner import (
+    MotionDistillation,
+    MotionStudentTeacherMLPHistory,
+    MotionStudentTeacherMLPPhase,
+    MotionStudentTeacherRecurrent,
+)
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -217,8 +222,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # create runner from rsl-rl
     rsl_runner_module.MotionDistillation = MotionDistillation
+    rsl_runner_module.MotionStudentTeacherMLPHistory = MotionStudentTeacherMLPHistory
+    rsl_runner_module.MotionStudentTeacherMLPPhase = MotionStudentTeacherMLPPhase
     rsl_runner_module.MotionStudentTeacherRecurrent = MotionStudentTeacherRecurrent
     rsl_distillation_runner_module.MotionDistillation = MotionDistillation
+    rsl_distillation_runner_module.MotionStudentTeacherMLPHistory = MotionStudentTeacherMLPHistory
+    rsl_distillation_runner_module.MotionStudentTeacherMLPPhase = MotionStudentTeacherMLPPhase
     rsl_distillation_runner_module.MotionStudentTeacherRecurrent = MotionStudentTeacherRecurrent
     runner_class = get_runner_class(agent_cfg.class_name)
     runner = runner_class(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)

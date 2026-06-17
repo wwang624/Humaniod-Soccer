@@ -87,6 +87,36 @@ class G1FlatStudentTeacherPPORunnerCfg(RslRlDistillationRunnerCfg):
     )
 
 
+@configclass
+class G1FlatMLPPhaseStudentTeacherPPORunnerCfg(RslRlDistillationRunnerCfg):
+    """Distill a recurrent soccer teacher into a randomly initialized MLP student with phase obs."""
+
+    num_steps_per_env = 24
+    max_iterations = 100000
+    save_interval = 1000
+    experiment_name = "g1_flat"
+    obs_groups = {"policy": ["policy"], "teacher": ["teacher"]}
+    policy = RslRlDistillationStudentTeacherRecurrentCfg(
+        class_name="MotionStudentTeacherMLPPhase",
+        init_noise_std=0.1,
+        student_obs_normalization=True,
+        teacher_obs_normalization=False,
+        student_hidden_dims=[512, 256, 128],
+        teacher_hidden_dims=[128, 64, 32],
+        activation="elu",
+        rnn_type="lstm",
+        rnn_hidden_dim=128,
+        rnn_num_layers=2,
+        teacher_recurrent=True,
+    )
+    algorithm = RslRlDistillationAlgorithmCfg(
+        class_name="MotionDistillation",
+        num_learning_epochs=5,
+        learning_rate=1.0e-3,
+        gradient_length=24,
+    )
+
+
 
 @configclass
 class G1FlatLowFreqPPORunnerCfg(G1FlatPPORunnerCfg):

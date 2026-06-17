@@ -479,11 +479,54 @@ class G1FlatSoccerDistillEnvCfg(G1FlatSoccerStudentEnvCfg):
         super().__post_init__()
         soccer_target_noise_params = {
             "command_name": "motion",
-            "ball_noise_std": (0.03, 0.03, 0.02),
-            "goal_noise_std": (0.03, 0.03, 0.02),
+            # "ball_noise_std": (0.03, 0.03, 0.02),
+            # "goal_noise_std": (0.03, 0.03, 0.02),
+            "ball_noise_std": (0.1, 0.1, 0.05),
+            "goal_noise_std": (0.1, 0.1, 0.05),
             "noise_type": "normal",
             "update_interval": 2,
-            "dropout_prob": 0.10,
+            # "dropout_prob": 0.10,
+            "dropout_prob": 0.25,
+            "hold_last": True,
+        }
+        self.observations.policy.target_point_pos = ObsTerm(
+            func=mdp.noisy_target_point_pos,
+            params=soccer_target_noise_params,
+        )
+        self.observations.policy.target_destination_pos_local = ObsTerm(
+            func=mdp.noisy_target_destination_pos_local,
+            params=soccer_target_noise_params,
+        )
+        self.terminations.anchor_pos_z.params["threshold"] = 0.15
+        self.terminations.anchor_ori = None
+        self.terminations.ee_body_pos = None
+
+
+@configclass
+class G1FlatSoccerMLPPhaseStudentEnvCfg(G1FlatSoccerStudentEnvCfg):
+    """Clean MLP student environment with explicit motion phase for play/export."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.observations.policy.motion_phase = ObsTerm(
+            func=mdp.motion_phase_sin_cos,
+            params={"command_name": "motion"},
+        )
+
+
+@configclass
+class G1FlatSoccerMLPPhaseDistillEnvCfg(G1FlatSoccerMLPPhaseStudentEnvCfg):
+    """MLP student distillation environment with phase, perception noise, and loose terminations."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        soccer_target_noise_params = {
+            "command_name": "motion",
+            "ball_noise_std": (0.1, 0.1, 0.05),
+            "goal_noise_std": (0.1, 0.1, 0.05),
+            "noise_type": "normal",
+            "update_interval": 2,
+            "dropout_prob": 0.25,
             "hold_last": True,
         }
         self.observations.policy.target_point_pos = ObsTerm(

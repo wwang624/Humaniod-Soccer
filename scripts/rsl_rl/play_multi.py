@@ -83,7 +83,12 @@ from soccer.utils.exporter import (
     export_motion_policy_as_onnx,
     export_multi_motion_policy_as_onnx,
 )
-from soccer.utils.my_on_policy_runner import MotionDistillation, MotionStudentTeacherRecurrent
+from soccer.utils.my_on_policy_runner import (
+    MotionDistillation,
+    MotionStudentTeacherMLPHistory,
+    MotionStudentTeacherMLPPhase,
+    MotionStudentTeacherRecurrent,
+)
 
 def get_motion_files(motion_path: str) -> list[str]:
     """
@@ -130,8 +135,12 @@ def get_runner_class(class_name: str):
 
 def register_custom_rsl_rl_classes():
     rsl_runner_module.MotionDistillation = MotionDistillation
+    rsl_runner_module.MotionStudentTeacherMLPHistory = MotionStudentTeacherMLPHistory
+    rsl_runner_module.MotionStudentTeacherMLPPhase = MotionStudentTeacherMLPPhase
     rsl_runner_module.MotionStudentTeacherRecurrent = MotionStudentTeacherRecurrent
     rsl_distillation_runner_module.MotionDistillation = MotionDistillation
+    rsl_distillation_runner_module.MotionStudentTeacherMLPHistory = MotionStudentTeacherMLPHistory
+    rsl_distillation_runner_module.MotionStudentTeacherMLPPhase = MotionStudentTeacherMLPPhase
     rsl_distillation_runner_module.MotionStudentTeacherRecurrent = MotionStudentTeacherRecurrent
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")

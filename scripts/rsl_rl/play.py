@@ -62,7 +62,12 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 # Import extensions to set up environment tasks
 import soccer.tasks  # noqa: F401
 from soccer.utils.exporter import attach_onnx_metadata, export_motion_policy_as_onnx
-from soccer.utils.my_on_policy_runner import MotionDistillation, MotionStudentTeacherRecurrent
+from soccer.utils.my_on_policy_runner import (
+    MotionDistillation,
+    MotionStudentTeacherMLPHistory,
+    MotionStudentTeacherMLPPhase,
+    MotionStudentTeacherRecurrent,
+)
 
 
 def get_runner_class(class_name: str):
@@ -75,8 +80,12 @@ def get_runner_class(class_name: str):
 
 def register_custom_rsl_rl_classes():
     rsl_runner_module.MotionDistillation = MotionDistillation
+    rsl_runner_module.MotionStudentTeacherMLPHistory = MotionStudentTeacherMLPHistory
+    rsl_runner_module.MotionStudentTeacherMLPPhase = MotionStudentTeacherMLPPhase
     rsl_runner_module.MotionStudentTeacherRecurrent = MotionStudentTeacherRecurrent
     rsl_distillation_runner_module.MotionDistillation = MotionDistillation
+    rsl_distillation_runner_module.MotionStudentTeacherMLPHistory = MotionStudentTeacherMLPHistory
+    rsl_distillation_runner_module.MotionStudentTeacherMLPPhase = MotionStudentTeacherMLPPhase
     rsl_distillation_runner_module.MotionStudentTeacherRecurrent = MotionStudentTeacherRecurrent
 
 
