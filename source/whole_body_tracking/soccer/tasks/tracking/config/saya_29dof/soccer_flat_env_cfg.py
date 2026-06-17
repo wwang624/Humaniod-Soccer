@@ -143,22 +143,13 @@ class Saya29DoFFlatSoccerStudentEnvCfg(Saya29DoFFlatKickEnvCfg):
         student_obs = self.observations.policy.copy()
         teacher_obs = self.observations.policy.copy()
         teacher_obs.enable_corruption = False
-        soccer_target_noise_params = {
-            "command_name": "motion",
-            "ball_noise_std": (0.03, 0.03, 0.02),
-            "goal_noise_std": (0.03, 0.03, 0.02),
-            "noise_type": "normal",
-            "update_interval": 2,
-            "dropout_prob": 0.10,
-            "hold_last": True,
-        }
         student_obs.target_point_pos = ObsTerm(
-            func=mdp.noisy_target_point_pos,
-            params=soccer_target_noise_params,
+            func=mdp.constant_target_point_pos,
+            params={"command_name": "motion"},
         )
         student_obs.target_destination_pos_local = ObsTerm(
-            func=mdp.noisy_target_destination_pos_local,
-            params=soccer_target_noise_params,
+            func=mdp.target_destination_pos_local,
+            params={"command_name": "motion"},
         )
         self.observations.teacher = teacher_obs
         self.observations.policy = student_obs
@@ -170,6 +161,23 @@ class Saya29DoFFlatSoccerDistillEnvCfg(Saya29DoFFlatSoccerStudentEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
+        soccer_target_noise_params = {
+            "command_name": "motion",
+            "ball_noise_std": (0.03, 0.03, 0.02),
+            "goal_noise_std": (0.03, 0.03, 0.02),
+            "noise_type": "normal",
+            "update_interval": 2,
+            "dropout_prob": 0.10,
+            "hold_last": True,
+        }
+        self.observations.policy.target_point_pos = ObsTerm(
+            func=mdp.noisy_target_point_pos,
+            params=soccer_target_noise_params,
+        )
+        self.observations.policy.target_destination_pos_local = ObsTerm(
+            func=mdp.noisy_target_destination_pos_local,
+            params=soccer_target_noise_params,
+        )
         self.terminations.anchor_pos_z.params["threshold"] = 0.15
         self.terminations.anchor_ori = None
         self.terminations.ee_body_pos = None

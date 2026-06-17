@@ -1,6 +1,7 @@
 import os
 
 import torch
+import torch.nn as nn
 from rsl_rl.algorithms import Distillation
 from rsl_rl.env import VecEnv
 from rsl_rl.runners.on_policy_runner import OnPolicyRunner
@@ -142,7 +143,23 @@ class MotionDistillation(Distillation):
             print("[INFO] MotionDistillation: freezing student observation normalizer updates.")
         print(f"[INFO] MotionDistillation: rollout_mode={self.rollout_mode}.")
 
+    @staticmethod
+    def _clone_hidden_states(hidden_states):
+        if hidden_states is None:
+            return None
+
+        def clone_one(value):
+            if value is None:
+                return None
+            if isinstance(value, tuple):
+                return tuple(clone_one(item) for item in value)
+            return value.detach().clone()
+
+        return tuple(clone_one(value) for value in hidden_states)
+
     def act(self, obs):
+        if getattr(self.policy, "is_recurrent", False):
+            self.transition.hidden_states = self.policy.get_hidden_states()
         if self.rollout_mode == "sample":
             self.transition.actions = self.policy.act(obs).detach()
         else:
@@ -160,6 +177,75 @@ class MotionDistillation(Distillation):
         self.storage.add_transitions(self.transition)
         self.transition.clear()
         self.policy.reset(dones)
+
+    def update(self):
+        rollout_start_hidden_states = self._clone_hidden_states(self.last_hidden_states)
+        rollout_end_hidden_states = self._clone_hidden_states(self.policy.get_hidden_states())
+
+        self.num_updates += 1
+        mean_behavior_loss = 0.0
+        mean_waist_behavior_loss = 0.0
+        loss = 0
+        cnt = 0
+
+        waist_action_indices = [2, 5, 8]
+
+        for _ in range(self.num_learning_epochs):
+            self.policy.reset(hidden_states=self._clone_hidden_states(rollout_start_hidden_states))
+            self.policy.detach_hidden_states()
+            for obs, _, privileged_actions, dones in self.storage.generator():
+                actions = self.policy.act_inference(obs)
+
+                behavior_loss = self.loss_fn(actions, privileged_actions)
+                action_sq_error = (actions - privileged_actions).pow(2)
+                valid_waist_indices = [idx for idx in waist_action_indices if idx < action_sq_error.shape[-1]]
+                if valid_waist_indices:
+                    waist_behavior_loss = action_sq_error[..., valid_waist_indices].mean()
+                    mean_waist_behavior_loss += waist_behavior_loss.item()
+
+                loss = loss + behavior_loss
+                mean_behavior_loss += behavior_loss.item()
+                cnt += 1
+
+                if cnt % self.gradient_length == 0:
+                    self.optimizer.zero_grad()
+                    loss.backward()
+                    if self.is_multi_gpu:
+                        self.reduce_parameters()
+                    if self.max_grad_norm:
+                        nn.utils.clip_grad_norm_(self.policy.student.parameters(), self.max_grad_norm)
+                    self.optimizer.step()
+                    self.policy.detach_hidden_states()
+                    loss = 0
+
+                self.policy.reset(dones.view(-1))
+                self.policy.detach_hidden_states(dones.view(-1))
+
+            if loss != 0:
+                self.optimizer.zero_grad()
+                loss.backward()
+                if self.is_multi_gpu:
+                    self.reduce_parameters()
+                if self.max_grad_norm:
+                    nn.utils.clip_grad_norm_(self.policy.student.parameters(), self.max_grad_norm)
+                self.optimizer.step()
+                self.policy.detach_hidden_states()
+                loss = 0
+
+        if cnt == 0:
+            raise RuntimeError("MotionDistillation.update() called with empty rollout storage.")
+
+        mean_behavior_loss /= cnt
+        mean_waist_behavior_loss = mean_waist_behavior_loss / cnt if mean_waist_behavior_loss else 0.0
+        self.storage.clear()
+        self.last_hidden_states = rollout_end_hidden_states
+        self.policy.reset(hidden_states=self._clone_hidden_states(rollout_end_hidden_states))
+        self.policy.detach_hidden_states()
+
+        return {
+            "behavior": mean_behavior_loss,
+            "behavior/waist": mean_waist_behavior_loss,
+        }
 
 
 class MyOnPolicyRunner(OnPolicyRunner):

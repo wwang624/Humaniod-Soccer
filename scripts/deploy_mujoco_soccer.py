@@ -108,6 +108,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stale-ball-print-interval", type=int, default=5, help="Print stale-ball observation/action diagnostics every N policy steps.")
     parser.add_argument("--print-policy-local-targets", action="store_true", default=False, help="Print ball/goal local coordinates that are fed into the ONNX observation.")
     parser.add_argument("--policy-local-target-print-interval", type=int, default=1, help="Print local target diagnostics every N policy steps when enabled.")
+    parser.add_argument("--action-clip", type=float, default=100.0, help="Clip policy actions before applying action scale.")
+    parser.add_argument("--waist-action-scale", type=float, default=1.0, help="Scale only waist yaw/roll/pitch policy actions before applying action scale.")
+    parser.add_argument("--waist-yaw-action-scale", type=float, default=None, help="Override scale for waist yaw action only.")
+    parser.add_argument("--waist-roll-action-scale", type=float, default=None, help="Override scale for waist roll action only.")
+    parser.add_argument("--waist-pitch-action-scale", type=float, default=None, help="Override scale for waist pitch action only.")
+    parser.add_argument(
+        "--waist-action-clip",
+        type=float,
+        default=-1.0,
+        help="Optional absolute clip only for waist yaw/roll/pitch actions. Negative disables waist-only clipping.",
+    )
+    parser.add_argument("--print-action-stats", action="store_true", default=False, help="Print policy action statistics.")
+    parser.add_argument("--action-stats-print-interval", type=int, default=1, help="Print action diagnostics every N policy steps when enabled.")
     return parser.parse_args()
 
 
@@ -440,6 +453,18 @@ class MujocoSoccerSim2Sim:
         self.h_state, self.c_state = self._zero_recurrent_state()
         self.last_action = np.zeros_like(self.default_joint_pos, dtype=np.float32)
         self.target_joint_pos = self.default_joint_pos.copy()
+        self.waist_action_indices = np.asarray(
+            [
+                idx for idx, name in enumerate(self.isaac_joint_names)
+                if name in ("waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint")
+            ],
+            dtype=np.int32,
+        )
+        self.waist_action_index_by_name = {
+            name: idx
+            for idx, name in enumerate(self.isaac_joint_names)
+            if name in ("waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint")
+        }
         self.time_step = 0
         self.current_motion_idx = 0
         self.current_motion_length = 0
@@ -854,6 +879,28 @@ class MujocoSoccerSim2Sim:
             f"ball_local_obs={np.round(self.current_obs_ball_local, 3).tolist()}"
         )
 
+    def _maybe_log_action_stats(self, action: np.ndarray) -> None:
+        if not self.args.print_action_stats:
+            return
+        if self.policy_step_count % max(1, self.args.action_stats_print_interval) != 0:
+            return
+        waist_report = {
+            self.isaac_joint_names[idx]: float(action[idx])
+            for idx in self.waist_action_indices
+        }
+        waist_target_report = {
+            self.isaac_joint_names[idx]: float(self.target_joint_pos[idx])
+            for idx in self.waist_action_indices
+        }
+        print(
+            "[INFO] Action stats | "
+            f"step={self.policy_step_count} "
+            f"norm={float(np.linalg.norm(action)):.3f} "
+            f"max_abs={float(np.max(np.abs(action))):.3f} "
+            f"waist={waist_report} "
+            f"waist_target={waist_target_report}"
+        )
+
     def _get_policy_local_targets_now(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         root_pos_w, root_quat_w = self._get_soccer_obs_world()
         ball_pos_w, _ = self._get_ball_world()
@@ -907,7 +954,29 @@ class MujocoSoccerSim2Sim:
         return obs.reshape(1, -1)
 
     def _apply_action(self, action: np.ndarray):
-        action = np.clip(action, -100.0, 100.0).astype(np.float32)
+        action = action.astype(np.float32).copy()
+        if self.waist_action_indices.size > 0:
+            action[self.waist_action_indices] *= float(self.args.waist_action_scale)
+            per_joint_scales = {
+                "waist_yaw_joint": self.args.waist_yaw_action_scale,
+                "waist_roll_joint": self.args.waist_roll_action_scale,
+                "waist_pitch_joint": self.args.waist_pitch_action_scale,
+            }
+            for joint_name, scale in per_joint_scales.items():
+                if scale is None:
+                    continue
+                idx = self.waist_action_index_by_name.get(joint_name)
+                if idx is not None:
+                    action[idx] *= float(scale)
+            if self.args.waist_action_clip >= 0.0:
+                waist_clip = abs(float(self.args.waist_action_clip))
+                action[self.waist_action_indices] = np.clip(
+                    action[self.waist_action_indices],
+                    -waist_clip,
+                    waist_clip,
+                )
+        clip = abs(float(self.args.action_clip))
+        action = np.clip(action, -clip, clip).astype(np.float32)
         target_joint_pos = self.default_joint_pos + self.action_scale * action
         self.target_joint_pos = target_joint_pos
         self.last_action = action.copy()
@@ -1144,6 +1213,7 @@ class MujocoSoccerSim2Sim:
                     self._maybe_log_policy_local_targets()
                     self._maybe_log_stale_ball(action)
                     self._apply_action(action)
+                    self._maybe_log_action_stats(self.last_action)
                     self.h_state, self.c_state = h_out, c_out
                     self.time_step += 1
                     self.policy_step_count += 1

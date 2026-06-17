@@ -26,6 +26,7 @@ def export_motion_policy_as_onnx(
 ):
     if not os.path.exists(path):
         os.makedirs(path, exist_ok=True)
+    normalizer = _resolve_policy_normalizer(actor_critic, normalizer)
     policy_exporter = _OnnxMotionPolicyExporter(env, actor_critic, normalizer, verbose, motion_name)
     policy_exporter.export(path, filename)
 
@@ -40,8 +41,18 @@ def export_multi_motion_policy_as_onnx(
 ):
     if not os.path.exists(path):
         os.makedirs(path, exist_ok=True)
+    normalizer = _resolve_policy_normalizer(actor_critic, normalizer)
     policy_exporter = _OnnxMultiMotionPolicyExporter(env, actor_critic, normalizer, verbose)
     policy_exporter.export(path, filename)
+
+
+def _resolve_policy_normalizer(actor_critic: object, normalizer: object | None) -> object | None:
+    if normalizer is not None:
+        return normalizer
+    student_normalizer = getattr(actor_critic, "student_obs_normalizer", None)
+    if student_normalizer is not None and not isinstance(student_normalizer, torch.nn.Identity):
+        return student_normalizer
+    return None
 
 
 class _OnnxMotionPolicyExporter(_OnnxPolicyExporter):
