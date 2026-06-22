@@ -163,11 +163,14 @@ class Saya29DoFFlatSoccerDistillEnvCfg(Saya29DoFFlatSoccerStudentEnvCfg):
         super().__post_init__()
         soccer_target_noise_params = {
             "command_name": "motion",
-            "ball_noise_std": (0.03, 0.03, 0.02),
-            "goal_noise_std": (0.03, 0.03, 0.02),
             "noise_type": "normal",
+            "physics_guided": True,
+            "c_min": 0.01,
+            "c_vel": 60.0,
+            "c_dist": 120.0,
+            "max_std": 0.12,
             "update_interval": 2,
-            "dropout_prob": 0.10,
+            "dropout_prob": 0.25,
             "hold_last": True,
         }
         self.observations.policy.target_point_pos = ObsTerm(

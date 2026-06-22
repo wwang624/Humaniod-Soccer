@@ -266,6 +266,33 @@ def _sample_target_noise(
     raise ValueError(f"Unsupported soccer target noise_type: {noise_type}")
 
 
+def _sample_physics_guided_target_noise(
+    clean: torch.Tensor,
+    velocity: torch.Tensor,
+    noise_type: str,
+    c_min: float,
+    c_vel: float,
+    c_dist: float,
+    max_std: float | None,
+) -> torch.Tensor:
+    """Sample paper-style object observation noise.
+
+    Kong et al. define sigma = c_min + ||v_obj|| / c_vel + ||p_obj|| / c_dist
+    for ball/goal observations expressed in the robot frame.  The paper does not
+    publish the constants, so they are exposed in the env config.
+    """
+    vel_norm = torch.norm(velocity, dim=-1, keepdim=True)
+    dist_norm = torch.norm(clean, dim=-1, keepdim=True)
+    sigma = float(c_min) + vel_norm / max(float(c_vel), 1e-6) + dist_norm / max(float(c_dist), 1e-6)
+    if max_std is not None and max_std > 0.0:
+        sigma = torch.clamp(sigma, max=float(max_std))
+    if noise_type == "normal":
+        return torch.randn_like(clean) * sigma
+    if noise_type == "uniform":
+        return (torch.rand_like(clean) * 2.0 - 1.0) * sigma
+    raise ValueError(f"Unsupported soccer target noise_type: {noise_type}")
+
+
 def _noisy_soccer_target_pair(
     env: ManagerBasedEnv,
     command_name: str = "motion",
@@ -276,6 +303,11 @@ def _noisy_soccer_target_pair(
     update_interval: int = 2,
     dropout_prob: float = 0.10,
     hold_last: bool = True,
+    physics_guided: bool = False,
+    c_min: float = 0.01,
+    c_vel: float = 60.0,
+    c_dist: float = 120.0,
+    max_std: float | None = 0.12,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return student perception targets with shared noise/dropout state.
 
@@ -291,10 +323,20 @@ def _noisy_soccer_target_pair(
 
     cache_name = f"_{command_name}_noisy_soccer_target_cache"
     cache = getattr(env, cache_name, None)
-    if cache is None or "step" not in cache or cache["ball"].shape[0] != env.num_envs:
+    if (
+        cache is None
+        or "step" not in cache
+        or "prev_clean_ball" not in cache
+        or "prev_clean_goal" not in cache
+        or "prev_step" not in cache
+        or cache["ball"].shape[0] != env.num_envs
+    ):
         cache = {
             "ball": clean_ball.clone(),
             "goal": clean_goal.clone(),
+            "prev_clean_ball": clean_ball.clone(),
+            "prev_clean_goal": clean_goal.clone(),
+            "prev_step": torch.full((env.num_envs,), -1, dtype=torch.long, device=clean_ball.device),
             "step": torch.full((env.num_envs,), -1, dtype=torch.long, device=clean_ball.device),
         }
         setattr(env, cache_name, cache)
@@ -330,10 +372,27 @@ def _noisy_soccer_target_pair(
             cache["goal"][invalid_update_mask] = clean_goal[invalid_update_mask]
 
     if torch.any(valid_update_mask):
-        noisy_ball = clean_ball + _sample_target_noise(clean_ball, noise_type, ball_noise_std)
-        noisy_goal = clean_goal + _sample_target_noise(clean_goal, noise_type, goal_noise_std)
+        if physics_guided:
+            prev_step = cache["prev_step"]
+            step_delta = (current_step - prev_step).to(dtype=clean_ball.dtype).clamp_min(1.0).view(-1, 1)
+            dt = float(getattr(env, "step_dt", getattr(env, "physics_dt", 1.0 / 50.0)))
+            dt = max(dt, 1e-6)
+            ball_vel = (clean_ball - cache["prev_clean_ball"]) / (step_delta * dt)
+            goal_vel = (clean_goal - cache["prev_clean_goal"]) / (step_delta * dt)
+            noisy_ball = clean_ball + _sample_physics_guided_target_noise(
+                clean_ball, ball_vel, noise_type, c_min, c_vel, c_dist, max_std
+            )
+            noisy_goal = clean_goal + _sample_physics_guided_target_noise(
+                clean_goal, goal_vel, noise_type, c_min, c_vel, c_dist, max_std
+            )
+        else:
+            noisy_ball = clean_ball + _sample_target_noise(clean_ball, noise_type, ball_noise_std)
+            noisy_goal = clean_goal + _sample_target_noise(clean_goal, noise_type, goal_noise_std)
         cache["ball"][valid_update_mask] = noisy_ball[valid_update_mask]
         cache["goal"][valid_update_mask] = noisy_goal[valid_update_mask]
+        cache["prev_clean_ball"][valid_update_mask] = clean_ball[valid_update_mask]
+        cache["prev_clean_goal"][valid_update_mask] = clean_goal[valid_update_mask]
+        cache["prev_step"][valid_update_mask] = current_step[valid_update_mask]
 
     cache["step"][update_mask] = current_step[update_mask]
 
@@ -349,6 +408,11 @@ def noisy_target_point_pos(
     update_interval: int = 2,
     dropout_prob: float = 0.10,
     hold_last: bool = True,
+    physics_guided: bool = False,
+    c_min: float = 0.01,
+    c_vel: float = 60.0,
+    c_dist: float = 120.0,
+    max_std: float | None = 0.12,
 ) -> torch.Tensor:
     ball, _ = _noisy_soccer_target_pair(
         env,
@@ -359,6 +423,11 @@ def noisy_target_point_pos(
         update_interval=update_interval,
         dropout_prob=dropout_prob,
         hold_last=hold_last,
+        physics_guided=physics_guided,
+        c_min=c_min,
+        c_vel=c_vel,
+        c_dist=c_dist,
+        max_std=max_std,
     )
     return ball
 
@@ -372,6 +441,11 @@ def noisy_target_destination_pos_local(
     update_interval: int = 2,
     dropout_prob: float = 0.10,
     hold_last: bool = True,
+    physics_guided: bool = False,
+    c_min: float = 0.01,
+    c_vel: float = 60.0,
+    c_dist: float = 120.0,
+    max_std: float | None = 0.12,
 ) -> torch.Tensor:
     _, goal = _noisy_soccer_target_pair(
         env,
@@ -382,6 +456,11 @@ def noisy_target_destination_pos_local(
         update_interval=update_interval,
         dropout_prob=dropout_prob,
         hold_last=hold_last,
+        physics_guided=physics_guided,
+        c_min=c_min,
+        c_vel=c_vel,
+        c_dist=c_dist,
+        max_std=max_std,
     )
     return goal
 
