@@ -148,9 +148,9 @@ def main():
     parser.add_argument("--left-foot-body", default="left_ankle_roll_link")
     parser.add_argument("--right-foot-body", default="right_ankle_roll_link")
     parser.add_argument("--contact-phase", type=float, default=0.9)
-    parser.add_argument("--radius-min-offset", type=float, default=-0.05)
-    parser.add_argument("--radius-max-offset", type=float, default=0.05)
-    parser.add_argument("--arc-angle", type=float, default=0.05, help="Angular randomization in radians.")
+    parser.add_argument("--radius-min-offset", type=float, default=-0.25)
+    parser.add_argument("--radius-max-offset", type=float, default=0.25)
+    parser.add_argument("--arc-angle", type=float, default=math.pi / 9, help="Angular randomization in radians.")
     args = parser.parse_args()
 
     output = args.output if args.output is not None else args.motion_dir / "ball_placement.png"

@@ -908,6 +908,12 @@ class MujocoSoccerSim2Sim:
         goal_local = self._compute_goal_local(root_pos_w, root_quat_w, ball_pos_w)
         return ball_local, goal_local, root_pos_w.astype(np.float32), root_quat_w.astype(np.float32)
 
+    def _motion_phase_sin_cos(self) -> np.ndarray:
+        denom = max(float(self.current_motion_length - 1), 1.0)
+        phase = np.clip(float(self.time_step) / denom, 0.0, 1.0)
+        angle = 2.0 * math.pi * phase
+        return np.array([math.sin(angle), math.cos(angle)], dtype=np.float32)
+
     def _build_obs(self) -> np.ndarray:
         ref = self._current_reference()
         root_pos_w, root_quat_w = self._get_soccer_obs_world()
@@ -935,6 +941,7 @@ class MujocoSoccerSim2Sim:
         self.current_goal_local = goal_local.astype(np.float32).copy()
         term_map["target_point_pos"] = ball_local.astype(np.float32)
         term_map["target_destination_pos_local"] = goal_local.astype(np.float32)
+        term_map["motion_phase"] = self._motion_phase_sin_cos()
         # term_map["target_destination_pos_local"] = np.array([5.0, 0.0, -0.48], dtype=np.float32)
 
         obs_terms: list[np.ndarray] = []

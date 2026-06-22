@@ -39,8 +39,8 @@ def _apply_saya_soccer_overrides(cfg) -> None:
     cfg.commands.motion.pose_range["yaw"] = (-math.pi, math.pi)
     cfg.commands.motion.rotate_soccer_targets_with_root_yaw = True
     cfg.commands.motion.curve_offset_range = {
-        "radius": (-0.05, 0.05),
-        "arc_angle": 0.05,
+        "radius": (-0.25, 0.25),
+        "arc_angle": math.pi / 9,
         "height": 0.11,
     }
     # if hasattr(cfg.rewards, "motion_global_anchor_ori"):
